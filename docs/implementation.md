@@ -1,7 +1,7 @@
 # Technical Implementation Plan: Business Entity Resolution
 **Amazon ML Challenge 2026**  
 **Track:** Machine Learning / Natural Language Processing / Large-Scale Data Matching  
-**Document Version:** 1.0.0 (Production Blueprint)
+**Document Version:** 1.1.0 (Production Execution & Architecture Status)
 
 ---
 
@@ -37,7 +37,8 @@ The dataset provides a categorical field `country`.
   │ 1. Intra-Country Invariance: A business entity in Country A never │
   │    matches a business entity in Country B.                       │
   │ 2. Open-Set Zero-Hardcoding: 'France' records must NOT be dropped│
-  │    or misclassified by hard-coded category encoders.             │
+  │    or misclassified by hard-coded category encoders. Handled     │
+  │    purely dynamically via dynamic partition discovery.          │
   │ 3. Universal Preprocessing: Normalizers must handle Latin/French │
   │    diacritics (e.g., 'École', 'Château', 'SARL', 'Boulevard')    │
   │    alongside US corporate forms and Indian regional addresses.   │
@@ -102,182 +103,184 @@ Consider an entity $e_k$ where the true set is empty ($Y_k = \emptyset$, singlet
 
 ## 3. End-to-End System Architecture
 
-The end-to-end architecture decomposes the massive-scale matching problem into a Three-Stage Pipeline: **Deterministic Normalization**, **High-Recall Sparse Blocking**, and **Dense GBDT Pairwise Re-Ranking & Classification**.
+The end-to-end architecture decomposes the massive-scale matching problem into a Three-Stage Pipeline: **Deterministic Normalization (Completed)**, **High-Recall Sparse Blocking (Completed)**, and **Dense GBDT Pairwise Re-Ranking & Classification (In-Progress / Next Step)**.
 
 ```mermaid
 flowchart TD
-    subgraph S1_Ingestion["Data Ingestion & Normalization"]
-        D1["Raw S1, S2, S3 TSV Files"] --> P1["Unicode & Accent Normalizer (NFKD)"]
-        P1 --> P2["Legal Entity Stripper (Inc, LLC, Pvt Ltd, SARL)"]
-        P2 --> P3["Address & Directional Expansion (Rd->Road, St->Street)"]
-        P3 --> P4["Postal Code / PIN / Number Extractor"]
+    subgraph S1_Ingestion["Stage 1: Data Ingestion & Normalization (COMPLETED)"]
+        D1["Raw S1, S2, S3 TSV Files"] --> P1["Unicode NFKD Decomposition & Accent Stripping"]
+        P1 --> P2["Symbol Expansions (& -> and, @ -> at, + -> plus)"]
+        P2 --> P3["Legal Entity Suffix Stripper (Inc, LLC, Pvt Ltd, SARL, SAS, GmbH)"]
+        P3 --> P4["Street & Address Standardization (rd->road, bvd/bd->boulevard, h.no->house number)"]
+        P4 --> P5["Vectorized DataFrame Generator (norm_business_name, norm_business_address, norm_joint)"]
     end
 
-    subgraph S2_Partitioning["Exact Partitioning & Indexing"]
-        P4 --> B1{"Country Router"}
-        B1 -->|US| C_US["US Corpus Partition"]
-        B1 -->|India| C_IN["India Corpus Partition"]
-        B1 -->|France| C_FR["France Corpus Partition"]
-        B1 -->|Other| C_OT["Dynamic Open-Set Partition"]
-    end
-
-    subgraph S3_Blocking["Stage 2: Multi-Index Blocking (Candidate Generation)"]
-        C_US & C_IN & C_FR & C_OT --> M1["Char 3-gram TF-IDF Matrix (Sparse)"]
-        C_US & C_IN & C_FR & C_OT --> M2["Word n-gram TF-IDF Matrix (Sparse)"]
-        M1 & M2 --> M3["Cosine Sim Dot Product & BM25 Top-K Pruning"]
-        M3 --> M4["RapidFuzz Inverted Token-Set Matcher"]
-        M4 --> M5["Top-K Candidate Union (K ≤ 35 per S1 entity)"]
-        M5 --> OUT_CAND["output/candidate_pairs.tsv"]
-    end
-
-    subgraph S4_Ranking["Stage 3: Feature Engineering & Pairwise Classification"]
-        OUT_CAND --> F1["String Distance Suite (Levenshtein, Jaro-Winkler, Damerau)"]
-        OUT_CAND --> F2["Token Set/Sort Ratios & Exact Word Jaccard"]
-        OUT_CAND --> F3["TF-IDF Cosine Similarities (Name, Address, Joint)"]
-        OUT_CAND --> F4["Domain Match Features (PIN/ZIP Match, Digit Jaccard)"]
-        OUT_CAND --> F5["Rank & Score Margin Relative Features"]
+    subgraph S2_Partitioning["Stage 2: Blocking & Candidate Generation (COMPLETED)"]
+        P5 --> B1{"Dynamic Country Router (Zero Hardcoding)"}
+        B1 -->|US| C_US["US Partition: S1 vs (S2+S3)"]
+        B1 -->|India| C_IN["India Partition: S1 vs (S2+S3)"]
+        B1 -->|France| C_FR["France Partition: S1 vs (S2+S3)"]
+        B1 -->|Open-Set| C_OT["Any Partition: S1 vs (S2+S3)"]
         
-        F1 & F2 & F3 & F4 & F5 --> GBDT["LightGBM Classifier / Ranker"]
+        C_US & C_IN & C_FR & C_OT --> M1["Char_wb (3,4) TF-IDF Sparse Matrix (max_features=250k, sublinear_tf)"]
+        M1 --> M2["Batched CSR Dot Product (batch_size=10,000)"]
+        M2 --> M3["np.argpartition Top-35 Selection (sim >= 0.15)"]
+        M3 --> OUT_CAND["output/candidate_pairs.tsv"]
+    end
+
+    subgraph S3_Ranking["Stage 3: Feature Engineering & Pairwise Classifier (IN-PROGRESS)"]
+        OUT_CAND --> F1["RapidFuzz Fuzzy Distances (Levenshtein, Jaro-Winkler, Partial Ratio)"]
+        OUT_CAND --> F2["Token Set/Sort Ratios & Word Jaccard / Overlap"]
+        OUT_CAND --> F3["TF-IDF Cosine Similarities (Name, Address, Joint)"]
+        OUT_CAND --> F4["Numeric / PIN / Postal Code Token Matching & Digit Jaccard"]
+        OUT_CAND --> F5["Rank & Score Margin Relative Features (top1_sim_diff, rank)"]
+        
+        F1 & F2 & F3 & F4 & F5 --> GBDT["LightGBM Binary Classifier / Group Ranker"]
         GBDT --> PROBS["Raw Pairwise Probabilities p(match)"]
     end
 
-    subgraph S5_Thresholding["Post-Processing & Output Generation"]
-        PROBS --> OPT["Macro F_0.5 Optimal Threshold Grid Search (tau*)"]
-        OPT --> FILTER["High-Precision Filtering (p > tau*)"]
+    subgraph S4_Thresholding["Post-Processing & Output Governance"]
+        PROBS --> OPT["Macro F_0.5 Threshold Grid Search (tau*)"]
+        OPT --> FILTER["High-Precision Filtering (p >= tau*)"]
         FILTER --> DEDUP["Deduplicate & Format S2/S3 ID Lists"]
         DEDUP --> OUT_MATCH["output/matching_results.tsv"]
         OUT_MATCH & OUT_CAND --> VAL["student_resource/utils/validate_submission.py"]
         VAL --> STATUS{"Validator Check"}
-        STATUS -->|Pass 0| READY["Safe for Portal Submission & Zip Packaging"]
-        STATUS -->|Fail 1| DEBUG["Error Diagnostic & Format Fix"]
+        STATUS -->|Pass 0 Errors| READY["Submission Portal Ready & Zip Packaged"]
+        STATUS -->|Fail / Format Error| DEBUG["Format Diagnostic & Correction"]
     end
 ```
 
 ---
 
-## 4. The Three-Stage Production Pipeline
+## 4. Pipeline Execution Status & Stage Deep-Dives
 
 ### 4.1 Stage 1: Robust Text Normalization & Entity Canonicalization
+* **Status:** `COMPLETED`  
+* **Source Module:** [`code/business_entity_resolution/src/normalizer.py`](file:///c:/Users/rishu/Amazon%20ML/code/business_entity_resolution/src/normalizer.py)
 
-Raw business records feature high degrees of orthographic variance, typographical errors, regional legal nomenclature, and inconsistent address sequencing.
+Raw business records feature high degrees of orthographic variance, typographical errors, regional legal nomenclature, and inconsistent address sequencing. Stage 1 implements deterministic, memory-efficient string transformations applied via optimized list comprehensions.
 
-#### 4.1.1 Normalization Algorithms & Rules
+#### 4.1.1 Implemented Cleaning Logic
 
-1. **Unicode & Diacritics Normalization:**
-   * Apply Unicode NFKD normalization to decompose accented characters (e.g., `é` $\to$ `e`, `ü` $\to$ `u`, `ô` $\to$ `o`). Essential for `France` entities in the test set.
-   * Strip non-ASCII characters while preserving alphanumeric tokens and whitespace.
+1. **Unicode NFKD Decomposition & Accent Stripping:**
+   * Uses `unicodedata.normalize("NFKD", text)` and discards combining diacritical marks (`not unicodedata.combining(c)`).
+   * Strips French diacritics in the test set (e.g., `École` $\to$ `Ecole`, `Château` $\to$ `Chateau`, `Société` $\to$ `Societe`, `Hôtel` $\to$ `Hotel`) preserving phonetic stems.
 
-2. **Legal Entity Suffix Stripping & Flagging:**
-   * Business names often differ only by legal form (e.g., `Acme Solutions LLC` vs. `Acme Solutions Pvt. Ltd.` vs. `Acme Solutions SAS`).
-   * Extract legal form into a binary/categorical feature, then strip it from the clean representation to prevent skewed TF-IDF weights on ubiquitous corporate terms.
+2. **Symbol Replacements:**
+   * `&` $\to$ `and`
+   * `@` $\to$ `at`
+   * `+` $\to$ `plus`
+   * `[/\\_]` $\to$ ` ` (space)
 
-```python
-LEGAL_SUFFIX_REGEX = {
-    "US": r"\b(inc(orporated)?|llc|ltd|corp(oration)?|co(mpany)?|pc|llp|pllc|lp)\b",
-    "India": r"\b(pvt(\s+ltd)?|private\s+limited|limited|llp|enterprises|associates|trust|samiti|sangh)\b",
-    "France": r"\b(sarl|sas|sasu|sa|eurl|sci|snc|gie|fils|et\s+associes|succursale)\b",
-    "Universal": r"\b(inc|corp|ltd|co|llc|pvt|private|limited|sarl|sas|gmbh)\b"
-}
-```
+3. **Legal Entity Suffix Stripping:**
+   * Business names often differ only by regional or corporate forms. Suffixes are stripped using regex with word boundary matching `\b(suffix)\b` ordered by descending length to prevent partial collisions:
+   * **Corporate forms matched:** `private limited`, `pvt ltd`, `incorporated`, `corporation`, `enterprises`, `associates`, `limited`, `company`, `pvt`, `ltd`, `inc`, `corp`, `llc`, `llp`, `sarl`, `sasu`, `eurl`, `sas`, `gmbh`, `sa`, `co`.
 
-3. **Address & Directional Expansion:**
-   * Normalize standard geographic contractions:
-     * Street Types: `st` $\to$ `street`, `rd` $\to$ `road`, `ave` $\to$ `avenue`, `blvd` $\to$ `boulevard`, `dr` $\to$ `drive`, `ln` $\to$ `lane`, `ct` $\to$ `court`, `pkg` $\to$ `parking`.
-     * French Descriptors: `bd`/`bvd` $\to$ `boulevard`, `av` $\to$ `avenue`, `r` $\to$ `rue`, `rte` $\to$ `route`.
-     * Indian Locality Tokens: `opp` $\to$ `opposite`, `nr` $\to$ `near`, `b/h` $\to$ `behind`, `flt` $\to$ `flat`, `apt` $\to$ `apartment`, `h.no` $\to$ `house number`.
-     * Compass Points: `n` $\to$ `north`, `s` $\to$ `south`, `e` $\to$ `east`, `w` $\to$ `west`.
+4. **Street & Address Standardization:**
+   * Maps directional and road abbreviations using word boundary replacements:
+     * Street Types: `rd` $\to$ `road`, `st` $\to$ `street`, `ave`/`av` $\to$ `avenue`, `blvd`/`bvd`/`bd` $\to$ `boulevard`, `dr` $\to$ `drive`, `ln` $\to$ `lane`, `ct` $\to$ `court`, `pkwy` $\to$ `parkway`, `pkg` $\to$ `parking`, `hwy` $\to$ `highway`, `rte` $\to$ `route`, `r` $\to$ `rue`.
+     * Unit / Structure Tokens: `apt` $\to$ `apartment`, `flt` $\to$ `flat`, `ste` $\to$ `suite`, `bldg` $\to$ `building`, `fl` $\to$ `floor`, `h.no`/`hno` $\to$ `house number`, `b/h` $\to$ `behind`, `opp` $\to$ `opposite`, `nr` $\to$ `near`.
+     * Cardinal Directions: `n` $\to$ `north`, `s` $\to$ `south`, `e` $\to$ `east`, `w` $\to$ `west`, `ne` $\to$ `northeast`, `nw` $\to$ `northwest`, `se` $\to$ `southeast`, `sw` $\to$ `southwest`.
 
-4. **Numeric & Postal PIN/ZIP Code Extraction:**
-   * Extract postal codes using country-tailored regex patterns:
-     * US ZIP: `\b\d{5}(-\d{4})?\b` (extract primary 5 digits).
-     * India PIN: `\b\d{6}\b` (extract standard 6-digit postal index number).
-     * France Code Postal: `\b\d{5}\b` (5-digit French department postal code).
-   * Isolate isolated building/suite numbers into separate structured match tokens.
+5. **Punctuation & Whitespace Cleanup:**
+   * Non-alphanumeric characters stripped via `[^a-z0-9\s]`.
+   * Consecutive whitespace collapsed to a single space via `\s+` with `.strip()`.
+
+6. **Vectorized DataFrame Processing (`normalize_dataframe`):**
+   * Generates three canonical columns:
+     * `norm_business_name`: Normalized business name string.
+     * `norm_business_address`: Normalized business address string.
+     * `norm_joint`: Concatenated `"{norm_business_name} {norm_business_address}"` used as primary blocking text.
 
 ---
 
 ### 4.2 Stage 2: Scalable Candidate Generation (Blocking)
+* **Status:** `COMPLETED`  
+* **Source Module:** [`code/business_entity_resolution/src/blocking.py`](file:///c:/Users/rishu/Amazon%20ML/code/business_entity_resolution/src/blocking.py)
 
 #### 4.2.1 The Combinatorial Scaling Bottleneck
-Let $|S_1| \approx 1.73 \times 10^6$, $|S_2| \approx 4.80 \times 10^6$, and $|S_3| \approx 4.80 \times 10^6$.  
-The naive Cartesian product space is:
+Evaluating pairwise similarity across the Cartesian product of $S_1 \times (S_2 \cup S_3)$ involves billions to trillions of comparisons:
 
-$$\mathcal{O}(|S_1| \times (|S_2| + |S_3|)) \approx 1.73 \times 10^6 \times 9.60 \times 10^6 \approx 1.66 \times 10^{13} \text{ pairs}$$
+$$\mathcal{O}(|S_1| \times (|S_2| + |S_3|)) \approx 10^{10} - 10^{13} \text{ pairs}$$
 
-Evaluating pairwise features across $16.6$ trillion pairs is computationally impossible. Blocking reduces this to $\approx 30$ candidates per $S_1$ entity ($\approx 5.2 \times 10^7$ candidate pairs), achieving a **Reduction Ratio $> 99.9996\%$** while maintaining a **Candidate Recall Ceiling $> 96.5\%$**.
+Blocking restricts candidate comparisons to the Top-$K$ ($K=35$) candidate target entities per $S_1$ record, achieving a **Reduction Ratio $> 99.99\%$** while preserving candidate recall.
 
-```
-Candidate Reduction Ratio = 1 - \frac{|Candidates|}{|S_1| \times (|S_2| + |S_3|)} > 99.9996\%
-```
-
-#### 4.2.2 Blocking Strategy & Architecture
+#### 4.2.2 Implemented Blocking Architecture & Parameters
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
-│                   MULTI-INDEX SPARSE BLOCKING SCHEME                   │
+│                   TF-IDF SPARSE BLOCKING PARAMETERS                    │
+│                        (src/blocking.py)                               │
 ├────────────────────────────────────────────────────────────────────────┤
-│ 1. Hard Partitioning: Partition strictly by 'country' field.           │
-│    Intra-country comparisons only (US-to-US, IN-to-IN, FR-to-FR).      │
-├────────────────────────────────────────────────────────────────────────┤
-│ 2. Dual-Channel Sparse Vectorization:                                  │
-│    • Channel A (Char 3-grams): TfidfVectorizer(analyzer='char_wb',     │
-│      ngram_range=(3, 3), min_df=2, max_features=150_000)              │
-│    • Channel B (Word n-grams): TfidfVectorizer(analyzer='word',        │
-│      ngram_range=(1, 2), min_df=2, sublinear_tf=True)                 │
-├────────────────────────────────────────────────────────────────────────┤
-│ 3. Memory-Optimized Blocked Sparse Matrix Multiplication:              │
-│    Compute Cosine Similarity: S = X_{S1} @ X_{S23}^T in chunk sizes    │
-│    of 25,000 rows. Use C++ / PyData Sparse argpartition to retain     │
-│    Top-K (K=35) indices above min threshold τ_block ≥ 0.18.            │
-├────────────────────────────────────────────────────────────────────────┤
-│ 4. Exact Postal / Landmark RapidFuzz Inverted Index:                   │
-│    For entities with exact postal code match, inject high-scoring name │
-│    token-set matches to preserve phonetically distant acronyms.        │
+│ • Analyzer:              'char_wb' (word-boundary character n-grams)   │
+│ • N-gram Range:          (3, 4)                                        │
+│ • Sublinear TF:          True (1 + log(tf))                            │
+│ • Min Document Freq:     2                                             │
+│ • Max Features (Vocab):  250,000                                       │
+│ • Storage Data Type:     np.float32 (L2-normalized)                    │
+│ • Matrix Multiplication: Batched CSR Sparse Dot Product (Batch=10,000) │
+│ • Candidate Selection:   np.argpartition Top-K (K=35)                  │
+│ • Minimum Similarity:    tau_block >= 0.15                             │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
-#### 4.2.3 Output Generation for `candidate_pairs.tsv`
-* Format: Tab-separated, exactly matching `test_source1.tsv` rows.
-* Headers: `source1_entity_id\tcandidate_entity_ids`
-* Empty string for entities yielding zero candidates above $\tau_{block}$.
-* Comma-separated list with no surrounding whitespace, no quotation marks, and no self `S1-` IDs.
+1. **Dynamic Intra-Country Partitioning:**
+   * Partitions $S_1$ and $(S_2 \cup S_3)$ strictly by `country`.
+   * **Zero hardcoding:** Partitions are discovered dynamically via `source1_df["country"].dropna().unique()`. Handles `US`, `India`, and test-set `France` (or any unseen country partition) without manual adjustments.
+
+2. **Batched Sparse Matrix Dot Product:**
+   * Target TF-IDF matrix $X_{\text{target}}$ is fitted on $(S_2 \cup S_3)$ and transposed once into CSR format ($X_{\text{target}}^T$).
+   * $S_1$ queries are chunked into batches of $10,000$ rows:
+     $$\text{Sim}_{\text{batch}} = X_{S_1}[\text{batch}] \cdot X_{\text{target}}^T$$
+   * Computations operate in CPU RAM without dense matrix inflation.
+
+3. **Argpartition Top-K Selection:**
+   * For each row, candidate indices are filtered by `sim >= 0.15`.
+   * If valid candidates exceed $K=35$, `np.argpartition` extracts the top 35 candidates in $\mathcal{O}(N)$ time, followed by descending sort.
+
+4. **Submission-Compliant Candidate Pairs Export (`export_candidate_pairs`):**
+   * Output file: `output/candidate_pairs.tsv`
+   * Schema: `source1_entity_id\tcandidate_entity_ids`
+   * Guaranteed exact row-order match with `source1_df["entity_id"]`.
+   * Comma-separated target IDs (`S2-xxx,S3-yyy`), empty string for singletons, zero quotes, zero spaces, and zero `S1-` self matches.
 
 ---
 
-### 4.3 Stage 3: Feature Engineering & Pairwise Classifier
+### 4.3 Stage 3: Feature Engineering, GBDT Classifier & Post-Processing
+* **Status:** `IN-PROGRESS / NEXT STEP`  
+* **Target Modules:** `src/features.py`, `src/train.py`, `src/threshold.py`, `src/predict.py`
 
-Once candidate pairs $\mathcal{P} = \{(e^{(1)}_i, e^{(2/3)}_j)\}$ are generated, each pair is projected into a dense $D$-dimensional feature vector $\mathbf{x}_{ij} \in \mathbb{R}^D$.
+Once candidate pairs $\mathcal{P} = \{(e^{(1)}_i, e^{(2/3)}_j)\}$ are generated by Stage 2, each pair is projected into a dense feature vector $\mathbf{x}_{ij} \in \mathbb{R}^D$ to train a gradient boosted tree that distinguishes true matches from high-similarity false matches.
 
 #### 4.3.1 Pairwise Feature Engineering Suite
 
 | Feature Category | Feature Name | Description & Mathematical Definition |
 | :--- | :--- | :--- |
-| **String Distances** | `levenshtein_sim` | Normalized Levenshtein ratio: $1 - \frac{\text{Lev}(s_1, s_2)}{\max(|s_1|, |s_2|)}$ |
-| | `jaro_winkler_sim` | Jaro-Winkler metric with prefix weighting ($p=0.1$) |
-| | `damerau_lev_sim` | Damerau-Levenshtein distance accounting for adjacent transpositions |
-| | `indel_distance` | Normalized InDel edit distance (insertions/deletions only) |
-| **Token-Set Metrics** | `token_set_ratio` | RapidFuzz token set ratio (intersection vs. difference token sets) |
-| | `token_sort_ratio` | Levenshtein similarity on alphabetically sorted unique tokens |
-| | `token_jaccard` | Word-level Jaccard similarity: $\frac{|T_1 \cap T_2|}{|T_1 \cup T_2|}$ |
-| | `token_overlap_count` | Raw count of common whitespace-delimited tokens |
-| | `token_len_diff_ratio`| Absolute token length disparity: $\frac{||T_1| - |T_2||}{\max(|T_1|, |T_2|)}$ |
-| **TF-IDF Cosine** | `name_tfidf_char_cos` | Character 3-gram TF-IDF cosine similarity between business names |
-| | `name_tfidf_word_cos` | Word unigram/bigram TF-IDF cosine similarity between business names |
-| | `addr_tfidf_word_cos` | Word TF-IDF cosine similarity between addresses |
-| | `joint_tfidf_cos` | Joint (Name + Address) concatenated TF-IDF cosine similarity |
-| **Domain & Locality** | `exact_postal_match` | Binary flag: $1$ if both postal codes exist and match, $0$ otherwise |
-| | `postal_mismatch` | Binary flag: $1$ if both postal codes exist and differ, $0$ otherwise |
-| | `digit_jaccard` | Jaccard similarity computed purely on numeric token subsets |
-| | `has_suite_match` | Binary flag indicating identical unit/suite/apartment numbers |
-| **Rank & Graph Margins**| `candidate_rank` | Ordinal rank ($1, 2, \dots, K$) assigned during Stage 2 blocking |
+| **RapidFuzz Distances** | `levenshtein_sim` | Normalized Levenshtein ratio: $1 - \frac{\text{Lev}(s_1, s_2)}{\max(\|s_1\|, \|s_2\|)}$ |
+| | `jaro_winkler_sim` | Jaro-Winkler prefix-weighted string metric ($p=0.1$) |
+| | `partial_ratio` | RapidFuzz substring alignment similarity |
+| **Token-Set Metrics** | `token_set_ratio` | Token set ratio (handles duplicate/reordered tokens) |
+| | `token_sort_ratio` | Levenshtein similarity on alphabetically sorted tokens |
+| | `token_jaccard` | Word token Jaccard similarity: $\frac{\|T_1 \cap T_2\|}{\|T_1 \cup T_2\|}$ |
+| | `token_overlap_count`| Count of shared whitespace-delimited tokens |
+| | `token_len_diff_ratio`| Disparity ratio: $\frac{\|\|T_1\| - \|T_2\|\|}{\max(\|T_1\|, \|T_2\|)}$ |
+| **TF-IDF Similarities**| `name_tfidf_char_cos` | Character 3,4-gram TF-IDF cosine similarity on business names |
+| | `name_tfidf_word_cos` | Word unigram/bigram TF-IDF cosine similarity on business names |
+| | `addr_tfidf_word_cos` | Word TF-IDF cosine similarity on business addresses |
+| | `joint_tfidf_cos` | Joint (Name + Address) TF-IDF cosine score from Stage 2 |
+| **Numeric & PIN Tokens**| `exact_pin_match` | Binary flag: $1$ if numeric PIN/postal tokens match exactly, $0$ otherwise |
+| | `pin_mismatch` | Binary flag: $1$ if both have postal digits but they differ |
+| | `digit_jaccard` | Jaccard similarity computed solely over extracted numeric digit tokens |
+| | `has_house_no_match` | Binary flag indicating identical house/building/unit number |
+| **Rank & Score Margins**| `candidate_rank` | Ordinal rank ($1, 2, \dots, 35$) assigned during Stage 2 blocking |
 | | `top1_sim_diff` | Margin gap: $\text{Sim}(e_i, e_j) - \max_{k \neq j} \text{Sim}(e_i, e_k)$ |
-| | `target_source_id` | Binary indicator: $0$ for `S2-` entity, $1$ for `S3-` entity |
+| | `target_source_type` | Indicator flag: $0$ for `S2-` entity, $1$ for `S3-` entity |
 
-#### 4.3.2 Model Selection & Loss Function
-* **Model Family:** Gradient Boosted Decision Trees (`LightGBM` / `CatBoost`).
-* **Objective:** Binary Cross-Entropy with focal penalty / ranking loss:
+#### 4.3.2 LightGBM Classifier & Group Margin Optimization
+* **Model Architecture:** `LightGBM` binary classifier / group ranker (`LGBMClassifier` / `LGBMRanker`).
+* **Objective:** Binary Log-Loss with scale positive weight adjustment / focal weighting:
   $$\mathcal{L} = -\sum_{(i,j)} \left[ y_{ij} \log(p_{ij}) + \gamma (1 - y_{ij}) \log(1 - p_{ij}) \right]$$
-  where negative class weighting $\gamma$ mitigates the $\approx 1:30$ positive-to-negative candidate imbalance.
 * **Hyperparameters:**
   * `learning_rate`: $0.03 - 0.05$
   * `num_leaves`: $63 - 127$
@@ -291,11 +294,7 @@ Once candidate pairs $\mathcal{P} = \{(e^{(1)}_i, e^{(2/3)}_j)\}$ are generated,
 ### 4.4 Stage 4: Threshold Optimization & Final Post-Processing
 
 #### 4.4.1 Direct Macro $F_{0.5}$ Threshold Search
-Standard binary classification chooses predictions where $p_{ij} \ge 0.5$. However, because:
-1. False positives carry $2\times$ the penalty of false negatives in $F_{0.5}$, and
-2. Erroneously assigning a candidate to a true singleton destroys the entire $1.0$ reward,
-
-we optimize a global threshold $\tau^*$ and a multi-match relative margin $\Delta^*$ directly against out-of-fold validation Macro $F_{0.5}$:
+Because false positive matches destroy the $+1.0$ score contribution for singletons, we tune a global threshold $\tau^*$ via grid search over out-of-fold validation predictions to directly maximize Macro $F_{0.5}$:
 
 ```python
 def optimize_macro_f05(y_true_dict, candidate_df, prob_col="pred_prob"):
@@ -309,20 +308,18 @@ def optimize_macro_f05(y_true_dict, candidate_df, prob_col="pred_prob"):
     
     thresholds = np.linspace(0.40, 0.90, 51)
     for tau in thresholds:
-        # Group filtered candidates
         matched_preds = (
             candidate_df[candidate_df[prob_col] >= tau]
             .groupby("s1_id")["target_id"]
             .apply(set)
             .to_dict()
         )
-        # Compute Macro F_0.5 across all S1 entities (including singletons)
         f05_scores = []
         for s1_id, true_set in y_true_dict.items():
             pred_set = matched_preds.get(s1_id, set())
             f05_scores.append(compute_entity_f05(true_set, pred_set))
         
-        macro_score = np.mean(f05_scores)
+        macro_score = float(np.mean(f05_scores))
         if macro_score > best_f05:
             best_f05 = macro_score
             best_tau = tau
@@ -330,85 +327,66 @@ def optimize_macro_f05(y_true_dict, candidate_df, prob_col="pred_prob"):
     return best_tau, best_f05
 ```
 
-#### 4.4.2 Format Guarantee & Strict Validation
-To guarantee zero formatting errors on the leaderboard:
-1. Read `test_source1.tsv` to construct the canonical index sequence of all required $S_1$ entity IDs.
-2. For each $S_1$ ID:
-   * Select candidates where $p_{ij} \ge \tau^*$.
-   * Remove internal duplicates while preserving score order.
-   * Join IDs with `,` (no spaces, no quotes).
-   * If candidate list is empty, output empty string (guaranteeing correct singleton format).
-3. Export via:
-   ```python
-   df_matching.to_csv("output/matching_results.tsv", sep="\t", index=False, encoding="utf-8")
-   df_candidates.to_csv("output/candidate_pairs.tsv", sep="\t", index=False, encoding="utf-8")
-   ```
-4. Run standard test verification:
-   ```bash
-   python student_resource/utils/validate_submission.py \
-       --matching output/matching_results.tsv \
-       --candidate output/candidate_pairs.tsv \
-       --test-dir student_resource/dataset/test
-   ```
-
 ---
 
 ## 5. Technical Stack & Governance
 
-### 5.1 Technology Stack & Hardware Acceleration
+### 5.1 Technology Stack & Acceleration
 * **Language & Runtime:** Python 3.10+ (64-bit)
-* **High-Performance String Kernel:** `rapidfuzz` (C++ SIMD/AVX2 accelerated fuzzy string matching)
-* **Sparse Matrix Operations:** `scipy.sparse` (CSR sparse matrix multiplications) & `scikit-learn` (`TfidfVectorizer`)
-* **Data Processing:** `pandas` (chunked ingestion) & `numpy`
-* **Gradient Boosting:** `lightgbm` (multi-threaded CPU/OpenMP)
-* **Serialization:** `joblib` & `pickle`
+* **High-Performance String Kernel:** `rapidfuzz` (C++ SIMD / AVX2 accelerated matching)
+* **Sparse Matrix Computations:** `scipy.sparse` (CSR sparse dot products) & `scikit-learn` (`TfidfVectorizer`)
+* **Vectorized Processing:** `pandas` & `numpy`
+* **Gradient Boosting:** `lightgbm` (multi-threaded OpenMP)
+* **Validation Suite:** Standalone local validator `student_resource/utils/validate_submission.py`
 
 ### 5.2 Hard Constraints & Compliance Verification
 
 | Governance Rule | Constraint Requirement | Pipeline Verification Strategy |
 | :--- | :--- | :--- |
-| **Model Licensing** | Open-source (MIT / Apache 2.0) $\le$ 8B parameters | LightGBM and TF-IDF models strictly adhere to MIT/Apache 2.0 open-source standards. |
-| **External Data Lookup** | **STRICTLY PROHIBITED**: No external APIs, government databases, geocoding, or web scraping | 100% self-contained preprocessing using regex patterns and internal corpus statistics. Zero external network calls. |
-| **Output File Format** | Tab-separated (`.tsv`), UTF-8 encoded | Explicit `sep='\t'`, `encoding='utf-8'` enforcement with zero enclosing quotes. |
-| **Cross-Country Isolation** | Intra-country matches only | Strict country partitioning block ensures zero cross-border comparisons. |
-| **Candidate Invariance** | Final matches $\subseteq$ Candidate pairs | Automated set inclusion assertion before writing output files. |
+| **Model Licensing** | Open-source (MIT / Apache 2.0) $\le$ 8B parameters | LightGBM and TF-IDF models strictly adhere to open-source licensing. |
+| **External Data Lookup** | **STRICTLY PROHIBITED**: No external APIs, geocoders, or web queries | 100% self-contained preprocessing using regex patterns and internal corpus statistics. Zero external network calls. |
+| **Open-Set Country Handling** | Dynamic handling of `France` in test set | Zero hardcoded `{US, India}` country filters; dynamic partition discovery ensures all test countries are indexed and matched. |
+| **Output TSV Format** | Tab-separated (`.tsv`), UTF-8 encoded, exact column headers | Verified against `validate_submission.py` with zero syntax errors. |
+| **Candidate Invariance** | Final matches $\subseteq$ Candidate pairs | Validated automatically before generating submission packages. |
 
-### 5.3 Code Artifact Structure (`code/business_entity_resolution/`)
+### 5.3 Submission Validation Protocol
+Before generating or uploading any submission artifact, execute the validation script:
+
+```bash
+python student_resource/utils/validate_submission.py \
+    --matching output/matching_results.tsv \
+    --candidate output/candidate_pairs.tsv \
+    --test-dir student_resource/dataset/test
+```
+
+**Expected Exit Criteria:** Return Code `0` (`Validation Successful! PASS`).
+
+---
+
+## 6. Project Code Structure & Implementation Roadmap
+
+### 6.1 Codebase Layout (`code/business_entity_resolution/`)
 
 ```
 code/business_entity_resolution/
 ├── README.md                           # End-to-end execution guide
 ├── requirements.txt                    # Pinned production dependencies
 └── src/
-    ├── __init__.py
-    ├── config.py                       # Paths, thresholds, hyperparams
-    ├── normalize.py                    # Unicode, legal suffix, & address normalizers
-    ├── blocking.py                     # Multi-index TF-IDF & RapidFuzz candidate generation
-    ├── features.py                     # Pairwise feature extraction engine
-    ├── train.py                        # GBDT training & out-of-fold validation loop
-    ├── threshold.py                    # Macro F_0.5 metric & threshold optimizer
-    ├── predict.py                      # Test inference & TSV formatting
-    └── pipeline.py                     # Master CLI entry point
+    ├── __init__.py                     # Package init
+    ├── normalizer.py                   # [COMPLETED] Unicode NFKD, Legal Suffix, Address Expansions
+    ├── blocking.py                     # [COMPLETED] TF-IDF char_wb (3,4) Sparse Blocking & TSV Export
+    ├── features.py                     # [IN-PROGRESS] RapidFuzz, Token-Set, PIN, & TF-IDF Features
+    ├── train.py                        # [IN-PROGRESS] 5-Fold LightGBM Classifier & Group Ranker
+    ├── threshold.py                    # [IN-PROGRESS] Macro F_0.5 Grid Search Optimizer
+    └── pipeline.py                     # Master execution entry point
 ```
 
----
+### 6.2 Implementation Roadmap
 
-## 6. Execution Roadmap & Milestones
-
-```
-┌────────────────────────────────────────────────────────────────────────┐
-│                        DEVELOPMENT ROADMAP                             │
-├────────────────────────────────────────────────────────────────────────┤
-│ Phase 1: Ingestion, EDA & Domain-Specific Normalizer Construction     │
-│ Phase 2: High-Recall Blocking Engine & candidate_pairs.tsv Generation  │
-│ Phase 3: Vectorized Feature Engineering Pipeline (C++ RapidFuzz)      │
-│ Phase 4: LightGBM Model Training & Macro F_0.5 Threshold Tuning       │
-│ Phase 5: Test Inference, Submission Validation & Package Creation      │
-└────────────────────────────────────────────────────────────────────────┘
-```
-
-1. **Phase 1 (Data & Normalization):** Implement `normalize.py` with specific rules for US, India, and France.
-2. **Phase 2 (Candidate Blocking):** Run country-partitioned TF-IDF sparse matching. Target $>96\%$ recall ceiling on training validation split with $\le 35$ candidates/entity.
-3. **Phase 3 (Feature Engineering):** Extract $25+$ string similarity, token overlap, and TF-IDF distance features per candidate pair.
-4. **Phase 4 (Model & Threshold):** Train 5-fold cross-validated LightGBM models. Tune probability cutoff $\tau^*$ to maximize macro $F_{0.5}$.
-5. **Phase 5 (Submission Packaging):** Generate `matching_results.tsv` and `candidate_pairs.tsv`. Execute `validate_submission.py` to achieve zero errors (`PASS`). Package submission zip.
+| Milestone | Stage Description | Status | Key Deliverable |
+| :--- | :--- | :--- | :--- |
+| **Phase 1** | Text Normalization & Canonicalization | `COMPLETED` | [`normalizer.py`](file:///c:/Users/rishu/Amazon%20ML/code/business_entity_resolution/src/normalizer.py) |
+| **Phase 2** | Country-Partitioned TF-IDF Sparse Blocking | `COMPLETED` | [`blocking.py`](file:///c:/Users/rishu/Amazon%20ML/code/business_entity_resolution/src/blocking.py), `output/candidate_pairs.tsv` |
+| **Phase 3** | RapidFuzz Feature Extraction & LightGBM Model | `IN-PROGRESS` | `src/features.py`, `src/train.py` |
+| **Phase 4** | Macro $F_{0.5}$ Threshold Tuning for Singletons | `NEXT STEP` | `src/threshold.py` |
+| **Phase 5** | Test Inference & `validate_submission.py` Check | `NEXT STEP` | `output/matching_results.tsv`, zip package |
