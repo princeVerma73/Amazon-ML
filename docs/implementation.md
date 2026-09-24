@@ -14,7 +14,7 @@ Each reference record $e_1 \in \mathcal{S}_1$ maps to a set of matching records 
 - **Multi-Record Clusters ($M \in [2, 6]$):** $94.42\%$ of entities have between 2 and 6 valid cross-source duplicates.
 
 ```
-Ground Truth Match Count Distribution (Training Set):
+Ground Truth Match Count Distribution (Full Training Set):
 M = 0 (Singletons):  123,247 ( 5.58%) -> Output: ""
 M = 2:              375,212 (17.00%)
 M = 3:              530,841 (24.05%)
@@ -39,9 +39,13 @@ Total S1 Entities: 2,206,821 (100.0%)
 | (~11.70M total) | **Source 2 ($\mathcal{S}_2$)** | 4,887,273 | - | - | India: 2,312,565 (47.32%), US: 1,871,330 (38.29%), France: 703,378 (14.39%) |
 | | **Source 3 ($\mathcal{S}_3$)** | 5,082,316 | - | - | India: 2,405,000 (47.32%), US: 1,945,701 (38.28%), France: 731,615 (14.40%) |
 | | **Test Combined Pool** | **11,702,133** | - | - | **India: 5,527,551 (47.24%), US: 4,480,137 (38.28%), France: 1,694,445 (14.48%)** |
+| **Development Slice** | **Sample S1 (`sample_source1.tsv`)** | 25,000 | 0 (0.00%) | 0 (0.00%) | US: 15,000 (60.00%), India: 10,000 (40.00%) |
+| (`sample_data/`) | **Sample S2 (`sample_source2.tsv`)** | 66,875 | 0 (0.00%) | 2,756 (4.12%) | 41,875 Positives + 25,000 Distractors |
+| | **Sample S3 (`sample_source3.tsv`)** | 69,443 | 0 (0.00%) | 2,784 (4.01%) | 44,443 Positives + 25,000 Distractors |
+| | **Sample GT (`sample_ground_truth.tsv`)** | 25,000 | - | - | Singletons: 1,407 (5.63%), Linked: 23,593 (94.37%) |
 
 > [!IMPORTANT]
-> **Strict Submission Alignment:** The evaluation engine requires that `matching_results.tsv` strictly contains **exactly 1,732,544 rows**, corresponding 1-to-1 to the entities in `test_source1.tsv`. Any row omission, duplicate row, or index misalignment results in immediate disqualification.
+> **Strict Submission Alignment:** The evaluation engine requires that `matching_results.tsv` strictly contains **exactly 1,732,544 rows**, corresponding 1-to-1 to the entities in `test_source1.tsv`. Any row omission, duplicate row, or index misalignment results in immediate rejection.
 
 ### 1.3 Scalability & Complexity Constraints
 The Cartesian product between reference $\mathcal{S}_1$ and target $(\mathcal{S}_2 \cup \mathcal{S}_3)$ pools:
@@ -52,7 +56,7 @@ Evaluating tens of trillions of pairs via brute-force pairwise string distances 
 
 To achieve sub-linear evaluation complexity:
 1. **Dynamic Country Partitioning:** Isolates the search space strictly within each country group (never comparing cross-country).
-2. **Dual-Channel Sparse TF-IDF Indexing:** Reduces the candidate search space from $\sim 10\text{M}$ targets down to $K \in [30, 40]$ candidate pairs per reference entity via highly optimized sparse matrix multiplications.
+2. **Weighted Composite Sparse TF-IDF Indexing:** Reduces the candidate search space from $\sim 10\text{M}$ targets down to $K \in [30, 40]$ candidate pairs per reference entity via highly optimized sparse matrix multiplications.
 3. **Complexity Reduction:** Total pairwise evaluations drop from $1.73 \times 10^{13}$ to $\approx 5.2 \times 10^7$ candidate pairs on the test set ($>99.9997\%$ search space reduction).
 
 ### 1.4 Evaluation Metric: Macro $F_{0.5}$
@@ -85,16 +89,16 @@ flowchart TD
         A5 --> A6{Address is NaN?}
         A6 -- Yes --> A7[Synthesize Fallback Token from Business Name]
         A6 -- No --> A8[Extract Clean Address & Numeric/PIN Tokens]
-        A7 --> A9[Construct Dual-Channel Text Payloads]
+        A7 --> A9[Construct Weighted Joint Text Payload<br/>clean_joint = 2*clean_name + clean_addr]
         A8 --> A9
     end
 
     subgraph S2_Blocking [Scalable Candidate Generation / Blocking]
-        A9 --> B1[Fit Country-Specific Character n-gram TF-IDF<br/>char_wb 3-4]
-        B1 --> B2[Build Target Matrix Pool S2 + S3 CSR Sparse]
-        B2 --> B3[Batch Query Matrix S1: 10,000 rows/slice]
+        A9 --> B1[Fit Character n-gram TF-IDF on S2+S3 Target Pool<br/>char_wb 3-4, max_features 150k]
+        B1 --> B2[Build Target CSR Sparse Matrix per Country]
+        B2 --> B3[Batch Query Matrix S1: 5,000 rows/slice]
         B3 --> B4[Sparse Dot Product Cosine Retrieval]
-        B4 --> B5[Top-K Candidate Filtering K=30-40]
+        B4 --> B5[Top-K Candidate Filtering K=35, sim >= 0.12]
         B5 --> B6[Export output/candidate_pairs.tsv]
     end
 
@@ -109,7 +113,7 @@ flowchart TD
 
     subgraph S4_Output [Submission Export & Verification]
         C6 --> D1[Export output/matching_results.tsv]
-        D1 --> D2[Run utils/validate_submission.py Verification]
+        D1 --> D2[Run student_resource/utils/validate_submission.py]
         D2 --> D3{Strict Validation Pass?}
         D3 -- Yes --> D4[Ready for Packaging & Submission]
         D3 -- No --> D5[Flag Schema/Type Discrepancy]
@@ -118,104 +122,90 @@ flowchart TD
 
 ---
 
-## 3. Phase-by-Phase Technical Specifications
+## 3. Phase-by-Phase Technical Specifications & Progress
 
-### Development Strategy: Lean Sample Holdout Protocol
+### Development Strategy: Lean Sample Holdout Protocol `[COMPLETED]`
 To enable rapid experimentation and debugging without incurring massive I/O and computing overhead on the full $\sim 12.5\text{M}$ record set:
-- **Sample Slice Creation:** Extract a balanced holdout slice of $25,000$ reference $\mathcal{S}_1$ entities and their associated $\mathcal{S}_2 \cup \mathcal{S}_3$ ground-truth matches + random negative target pools into `sample_data/`.
-- **Iteration Protocol:** Benchmark Candidate Generation recall (target $>98.5\%$ candidate capture), feature computation speed, and Macro $F_{0.5}$ threshold curves in seconds on the holdout slice before scaling to full test inference.
+- **Sample Slice Creation:** Generated a stratified holdout slice of $25,000$ reference $\mathcal{S}_1$ entities and their associated $\mathcal{S}_2 \cup \mathcal{S}_3$ ground-truth matches + $50,000$ random negative distractors in `sample_data/`.
+- **Iteration Protocol:** Benchmark candidate generation recall (target $>98.5\%$ candidate capture), feature computation speed, and Macro $F_{0.5}$ threshold curves in seconds on the holdout slice before scaling to full test inference.
 
 ---
 
-### Phase 1: Data Normalization Pipeline
+### Phase 1: Data Normalization Pipeline `[COMPLETED]`
 
 #### 1. Unicode & Multi-Lingual Accent Handling
-The Test Set introduces **France** comprising $259,452$ records in Test $\mathcal{S}_1$ ($14.98\%$) and $1,434,993$ records across Test $\mathcal{S}_2$ and $\mathcal{S}_3$. To handle accented French characters (e.g., *Café Société Générale*, *Naïve Électronique*) without corruption:
+The Test Set introduces **France** comprising $259,452$ records in Test $\mathcal{S}_1$ ($14.98\%$) and $1,434,993$ records across Test $\mathcal{S}_2$ and $\mathcal{S}_3$. Accented French characters (e.g., *Café Société Générale*, *Naïve Électronique*) are normalized without corruption using Unicode NFKD decomposition:
 ```python
 import unicodedata
 
-def normalize_unicode(text: str) -> str:
-    if not isinstance(text, str):
+def normalize_text(s: str) -> str:
+    if not s or not isinstance(s, str):
         return ""
-    # NFKD decomposes characters (e.g., 'é' -> 'e' + combining acute)
-    normalized = unicodedata.normalize('NFKD', text)
-    # Filter out non-spacing diacritic marks
-    stripped = "".join(c for c in normalized if unicodedata.category(c) != 'Mn')
-    return stripped.lower().strip()
+    decomposed = unicodedata.normalize("NFKD", s)
+    stripped = "".join(c for c in decomposed if not unicodedata.combining(c))
+    text = stripped.lower().replace("&", " and ")
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
 ```
 
 #### 2. Multi-Jurisdiction Legal Entity Type Stripping
-Corporate suffixes introduce artificial token divergence or false high-frequency token overlaps across unrelated entities. Suffixes are stripped across US, Indian, and French legal structures:
+Corporate suffixes are stripped across US, Indian, and French legal structures using word boundaries (`\b`):
 
 | Jurisdiction | Suffixes & Variants Removed |
 | :--- | :--- |
 | **United States** | `corp`, `corporation`, `inc`, `incorporated`, `llc`, `l.l.c.`, `ltd`, `limited`, `co`, `company`, `lp`, `llp`, `pllc` |
 | **India** | `pvt ltd`, `private limited`, `ltd`, `limited`, `llp`, `enterprises`, `traders`, `industries`, `solutions`, `services` |
-| **France (Open-Set Test)** | `sarl`, `s.a.r.l.`, `sas`, `s.a.s.`, `sa`, `s.a.`, `sci`, `snc`, `eurl`, `gie`, `micro-entreprise`, `assoc` |
-
-```python
-import re
-
-LEGAL_SUFFIXES_REGEX = re.compile(
-    r'\b(?:pvt\s+ltd|private\s+limited|limited|ltd|llc|l\.l\.c\.|inc|incorporated|'
-    r'corp|corporation|co|company|llp|lp|pllc|sarl|s\.a\.r\.l\.|sas|s\.a\.s\.|'
-    r'sa|s\.a\.|eurl|sci|snc|gie|services|solutions|enterprises|traders)\b',
-    flags=re.IGNORECASE
-)
-
-def clean_business_name(name: str) -> str:
-    text = normalize_unicode(name)
-    text = LEGAL_SUFFIXES_REGEX.sub('', text)
-    text = re.sub(r'[^\w\s]', ' ', text)
-    return re.sub(r'\s+', ' ', text).strip()
-```
+| **France (Open-Set Test)** | `sarl`, `s.a.r.l.`, `sas`, `s.a.s.`, `sasu`, `sa`, `s.a.`, `sci`, `snc`, `eurl`, `gie`, `micro-entreprise`, `assoc` |
 
 #### 3. Address Standardization & Missing Address Fallback Pipeline
 EDA revealed that **344,883 records in $\mathcal{S}_2 \cup \mathcal{S}_3$ have missing (`NaN`) addresses**.
-- **When Address is Present:** Clean address string, extract numeric tokens (building numbers, PIN/ZIP codes, street numbers).
-- **When Address is NaN:** Execute fallback synthesis:
-  $$\text{Payload}_{\text{address}} \leftarrow \text{Payload}_{\text{name}}$$
-  $$\text{Flag}_{\text{address\_missing}} \leftarrow 1.0$$
-  This prevents null matrix multiplication errors while allowing name similarity to drive candidate retrieval with an engineered penalty flag for the GBDT classifier.
+- **When Address is Present:** Clean address string, expand abbreviations (`rd` $\to$ `road`, `st` $\to$ `street`, `ave` $\to$ `avenue`, `blvd` $\to$ `boulevard`, `opp` $\to$ `opposite`, etc.).
+- **When Address is Missing:** `clean_addr` is set to `""` and `is_addr_missing` indicator flag is set to `1`.
+- **Weighted Joint Text:** `clean_joint = clean_name + " " + clean_name + " " + clean_addr` weights the business name $2\times$ to ensure strong candidate capture even when addresses are missing or divergent.
 
 ---
 
-### Phase 2: Scalable Candidate Generation (Blocking)
+### Phase 2: Scalable Candidate Generation (Blocking) `[COMPLETED]`
 
 #### 1. Dynamic Country Partitioning
 No business entity in India, the US, or France matches an entity in a different country. Blocking dynamically partitions entities by country without hardcoding:
 
 ```python
-countries = sorted(set(s1_df['country'].unique()).union(set(target_df['country'].unique())))
+countries = sorted(df_s1["country"].dropna().unique())
 for country in countries:
-    s1_country = s1_df[s1_df['country'] == country]
-    target_country = target_df[target_df['country'] == country]
+    s1_country = df_s1[df_s1["country"] == country]
+    target_country = df_target[df_target["country"] == country]
     # Execute TF-IDF blocking independently per country partition
 ```
 
-- **Train Set:** Discovers `['India', 'US']` automatically.
-- **Test Set:** Discovers `['France', 'India', 'US']` automatically and processes France's $\sim 1.69\text{M}$ records in its own partition.
+- **Train Set:** Discovers `['India', 'US']` dynamically.
+- **Test Set:** Discovers `['France', 'India', 'US']` dynamically and processes France's $\sim 1.69\text{M}$ records in its own partition.
 
-#### 2. Dual-Channel Subword Character $n$-gram TF-IDF Indexing
-To remain robust against OCR misspellings, abbreviations, and phonetic variations, tokenization uses character boundary $n$-grams (`char_wb`, $n \in [3, 4]$):
-1. **Name Channel:** $\text{TFIDF}_{\text{name}}$ (sublinear term frequency scaling, $\text{max\_features} = 150,000$).
-2. **Address Channel:** $\text{TFIDF}_{\text{address}}$ (sublinear term frequency scaling, $\text{max\_features} = 200,000$).
+#### 2. Weighted Joint Character $n$-gram TF-IDF Indexing
+To remain robust against OCR misspellings, abbreviations, and phonetic variations, tokenization uses character boundary $n$-grams (`char_wb`, $n \in [3, 4]$) on the weighted joint representation:
+- **Vectorizer:** `TfidfVectorizer(analyzer='char_wb', ngram_range=(3, 4), min_df=2, sublinear_tf=True, max_features=150000)`.
+- **Fit Matrix:** Fit exclusively on combined target pool ($\mathcal{S}_2 \cup \mathcal{S}_3$) within the country partition.
+- **Querying:** Batch-transform reference entities $\mathcal{S}_1$ and perform sparse matrix dot products $\mathbf{S}_{\text{batch}} = \mathbf{Q}_{\text{batch}} \cdot \mathbf{M}_{\text{target}}^T$.
 
-Combined similarity metric for blocking:
+#### 3. High-Throughput Batch Query Matrix Processing & Verified Benchmark Results
+- Query $\mathcal{S}_{1, c}$ in batches of $B = 5,000$ rows.
+- Extract Top $K = 35$ candidates per entity meeting minimum cosine similarity threshold $\ge 0.12$.
+- Stream candidate pairs directly into `output/candidate_pairs.tsv` with header `source1_entity_id\tcandidate_entity_ids`.
 
-$$\text{Sim}_{\text{blocking}}(u, v) = \alpha \cdot \cos(\mathbf{n}_u, \mathbf{n}_v) + (1 - \alpha) \cdot \cos(\mathbf{a}_u, \mathbf{a}_v) \quad (\alpha = 0.65)$$
-
-#### 3. High-Throughput Batch Query Matrix Processing
-To minimize peak memory footprint below 16 GB RAM:
-- Fit vectorizers on $\mathcal{S}_{\text{target}, c}$ and transform $\mathcal{S}_{\text{target}, c}$ into Compressed Sparse Row (CSR) matrices.
-- Query $\mathcal{S}_{1, c}$ in batches of $B = 10,000$ rows:
-  $$\mathbf{S}_{\text{batch}} = \mathbf{Q}_{\text{batch}} \cdot \mathbf{M}_{\text{target}}^T$$
-- Retrieve top $K = 35$ candidates per query using `scipy.sparse` / fast partial sort (`argpartition`).
-- Stream generated pairs directly into `output/candidate_pairs.tsv` in chunked TSV appends.
+```
+Phase 2 Benchmark Verification on 25k Holdout Slice (sample_data/):
+- Total Reference S1 Entities Evaluated: 25,000
+- Total True Ground Truth Matches:      86,318
+- Captured True Matches in Top-35:       84,839
+- Candidate Recall Ceiling:              98.287%
+- Average Candidates per S1 Query:       34.99
+- Throughput:                            ~458 queries/sec
+- Format Validation:                     PASS (0 errors via validator)
+```
 
 ---
 
-### Phase 3: Pairwise Feature Engineering & Classification
+### Phase 3: Pairwise Feature Engineering & Classification `[PENDING]`
 
 #### 1. RapidFuzz & Mathematical Feature Suite
 For every candidate pair $(e_1, e_{\text{target}})$, compute a compact, non-redundant feature vector $\mathbf{x} \in \mathbb{R}^{14}$:
@@ -252,16 +242,17 @@ For every candidate pair $(e_1, e_{\text{target}})$, compute a compact, non-redu
 
 ---
 
-### Phase 4: Verification & Submission Packaging
+## 4. Verification & Submission Packaging
 
-#### 1. Required Directory Layout
+### 4.1 Required Directory Layout
 ```
 Amazon-ML/
 ├── code/
 │   └── business_entity_resolution/
 │       ├── src/
 │       │   ├── __init__.py
-│       │   ├── normalization.py       # Accent removal, suffix cleaning, address fallback
+│       │   ├── normalizer.py          # Accent removal, suffix cleaning, address fallback
+│       │   ├── make_sample.py         # 25k development slice generator
 │       │   ├── blocking.py            # Dynamic country partition & sparse TF-IDF top-K
 │       │   ├── feature_extraction.py  # RapidFuzz & numeric overlap feature pipeline
 │       │   ├── classifier.py          # LightGBM training, inference & thresholding
@@ -273,40 +264,42 @@ Amazon-ML/
 ├── output/
 │   ├── candidate_pairs.tsv            # Top-K candidate pairs from blocking phase
 │   └── matching_results.tsv           # Final predictions formatted for evaluation
+├── sample_data/                       # 25k reference entity development benchmark
 ├── student_resource/
 │   ├── Documentation_template.md      # Completed competition writeup
 │   └── utils/
 │       └── validate_submission.py     # Local submission verification script
 ```
 
-#### 2. Exact Output TSV Schema Specifications
+### 4.2 Exact Output TSV Schema Specifications
 
-##### `output/candidate_pairs.tsv`
+#### `output/candidate_pairs.tsv`
 ```tsv
-entity_id	candidate_entity_ids
+source1_entity_id	candidate_entity_ids
 S1-925783039	S2-764573417,S3-202863386,S2-166376419
 S1-773889195	S2-998124112,S3-112094812
 ```
 
-##### `output/matching_results.tsv`
+#### `output/matching_results.tsv`
 ```tsv
-entity_id	matched_entity_ids
+source1_entity_id	matched_entity_ids
 S1-925783039	S2-764573417,S3-202863386
 S1-773889195	
 ```
 *(Note: Singletons like `S1-773889195` contain no characters after the tab separator).*
 
-#### 3. Automated Validation Protocol
-Prior to submission packaging, the generated output is strictly validated against the official verification script:
+### 4.3 Automated Validation Protocol
+Prior to submission packaging, output files are verified using the official validator:
 ```powershell
 python student_resource/utils/validate_submission.py `
-  --submission-path output/matching_results.tsv `
-  --test-path student_resource/dataset/test/test_source1.tsv
+  --matching output/matching_results.tsv `
+  --candidate output/candidate_pairs.tsv `
+  --test-dir student_resource/dataset/test
 ```
 
 Verification enforces:
 1. Exact row-count alignment ($1,732,544$ rows) with `test_source1.tsv`.
 2. Correct tab delimiter (`\t`) without trailing spaces or quote wrapping.
-3. Header names strictly matching `entity_id` and `matched_entity_ids`.
+3. Header names strictly matching `source1_entity_id` and `matched_entity_ids` / `candidate_entity_ids`.
 4. Valid comma-separated formatting for multi-target entity IDs without malformed prefixes.
 5. Exact preservation of singleton empty strings.

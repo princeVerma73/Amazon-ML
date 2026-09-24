@@ -1,27 +1,31 @@
 """
-Multi-Index Sparse TF-IDF Blocking Module for Business Entity Resolution.
+Phase 2: Scalable Candidate Generation (Blocking) Module.
 
-Implements high-recall, country-partitioned candidate generation using
-character n-gram TF-IDF sparse matrix dot products. Strictly enforces
-cross-country isolation and outputs formatted candidate pairs adhering
-to the Amazon ML Challenge 2026 schema.
+Implements country-partitioned, character n-gram TF-IDF sparse matrix dot-product
+candidate retrieval for Business Entity Resolution. Dynamically handles open-set countries
+(US, India, France) and exports candidate pairs meeting the competition schema.
 """
 
 from __future__ import annotations
 
+import argparse
 import logging
 import os
+import sys
 import time
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import pandas as pd
 from scipy import sparse
 from sklearn.feature_extraction.text import TfidfVectorizer
 
-from .normalizer import normalize_dataframe
+try:
+    from .normalizer import preprocess_dataframe
+except (ImportError, ValueError):
+    from normalizer import preprocess_dataframe
 
-# Configure module-level logger
+# Logging setup
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -30,20 +34,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Sparse TF-IDF Blocker Class
-# ---------------------------------------------------------------------------
-
-class TFIDFBlocker:
+class DynamicTFIDFBlocker:
     """
-    High-performance, country-partitioned TF-IDF sparse blocking engine.
-    
-    Generates Top-K candidate pairs for each Source 1 query entity by:
-      1. Partitioning entities strictly by country.
-      2. Constructing unified representation (normalized name + normalized address).
-      3. Fitting character n-gram TF-IDF vectorizers on target corpus (Source 2 + Source 3).
-      4. Executing batch sparse matrix multiplications (X_query @ X_target.T).
-      5. Extracting Top-K candidates meeting minimum cosine similarity threshold.
+    Scalable, country-partitioned sparse TF-IDF candidate generation engine.
     """
 
     def __init__(
@@ -52,24 +45,11 @@ class TFIDFBlocker:
         analyzer: str = "char_wb",
         min_df: int = 2,
         top_k: int = 35,
-        min_similarity: float = 0.15,
-        batch_size: int = 10000,
+        min_similarity: float = 0.12,
+        batch_size: int = 5000,
         sublinear_tf: bool = True,
-        max_features: Optional[int] = 250000,
+        max_features: int = 150000,
     ) -> None:
-        """
-        Initialize the TFIDFBlocker with hyperparameters.
-        
-        Args:
-            ngram_range: (min_n, max_n) character n-gram range.
-            analyzer: Analyzer type ('char_wb' or 'char').
-            min_df: Minimum document frequency for vocabulary pruning.
-            top_k: Maximum candidate matches to retrieve per Source 1 entity.
-            min_similarity: Minimum cosine similarity cutoff for candidate inclusion.
-            batch_size: Batch size for sparse matrix multiplication to conserve RAM.
-            sublinear_tf: Apply sublinear scaling 1 + log(tf).
-            max_features: Maximum vocabulary size to cap memory usage.
-        """
         self.ngram_range = ngram_range
         self.analyzer = analyzer
         self.min_df = min_df
@@ -79,341 +59,265 @@ class TFIDFBlocker:
         self.sublinear_tf = sublinear_tf
         self.max_features = max_features
 
-    def _create_vectorizer(self) -> TfidfVectorizer:
-        """Create a fresh TfidfVectorizer instance with configured settings."""
-        return TfidfVectorizer(
+    def block_country_partition(
+        self,
+        s1_df_country: pd.DataFrame,
+        target_df_country: pd.DataFrame,
+        country_name: str,
+    ) -> Dict[str, List[str]]:
+        """
+        Execute sparse TF-IDF blocking within a single country partition.
+        
+        Args:
+            s1_df_country: Preprocessed Source 1 records for this country.
+            target_df_country: Combined preprocessed Source 2 + Source 3 records.
+            country_name: Country identifier string.
+            
+        Returns:
+            Dictionary mapping source1_entity_id -> list of candidate target entity_ids.
+        """
+        n_queries = len(s1_df_country)
+        n_targets = len(target_df_country)
+        
+        if n_queries == 0 or n_targets == 0:
+            logger.warning(f"Country {country_name} has empty query ({n_queries}) or target ({n_targets}) pool.")
+            return {eid: [] for eid in s1_df_country["entity_id"]}
+
+        logger.info(
+            f"[{country_name}] Fitting TF-IDF on {n_targets:,} target records (char_wb {self.ngram_range}, max_features={self.max_features:,})..."
+        )
+        fit_start = time.time()
+        
+        vectorizer = TfidfVectorizer(
             analyzer=self.analyzer,
             ngram_range=self.ngram_range,
             min_df=self.min_df,
             sublinear_tf=self.sublinear_tf,
             max_features=self.max_features,
             dtype=np.float32,
-            norm="l2",
         )
+        
+        # Fit vectorizer on target pool clean_joint text
+        target_matrix = vectorizer.fit_transform(target_df_country["clean_joint"].tolist())
+        target_matrix_t = target_matrix.T.tocsc()
+        fit_time = time.time() - fit_start
+        logger.info(f"[{country_name}] Target matrix shape: {target_matrix.shape} (built in {fit_time:.2f}s)")
 
-    def block_country_partition(
-        self,
-        s1_ids: Sequence[str],
-        s1_texts: Sequence[str],
-        target_ids: Sequence[str],
-        target_texts: Sequence[str],
-        country: str = "UNKNOWN",
-    ) -> Dict[str, List[str]]:
-        """
-        Perform blocking on a single country partition.
-        
-        Args:
-            s1_ids: List of Source 1 entity IDs.
-            s1_texts: List of normalized matching strings for Source 1.
-            target_ids: List of target (Source 2 + Source 3) entity IDs.
-            target_texts: List of normalized matching strings for target corpus.
-            country: Name of the country partition for logging.
-            
-        Returns:
-            Dictionary mapping source1_entity_id -> list of candidate entity IDs.
-        """
-        n_s1 = len(s1_ids)
-        n_target = len(target_ids)
-        
-        logger.info(
-            f"Blocking partition '{country}': {n_s1:,} S1 entities vs. "
-            f"{n_target:,} Target entities."
-        )
-        
-        results: Dict[str, List[str]] = {s1_id: [] for s1_id in s1_ids}
-        
-        if n_s1 == 0 or n_target == 0:
-            logger.warning(
-                f"Partition '{country}' is empty on one side (S1: {n_s1}, Target: {n_target})."
-            )
-            return results
-            
-        # 1. Fit vectorizer on target corpus (and transform both)
-        start_time = time.time()
-        vectorizer = self._create_vectorizer()
-        
-        # Fit-transform target corpus
-        X_target = vectorizer.fit_transform(target_texts)
-        logger.info(
-            f"[{country}] Target TF-IDF matrix: {X_target.shape[0]:,} rows x "
-            f"{X_target.shape[1]:,} features ({X_target.nnz:,} non-zeros). "
-            f"Vectorization took {time.time() - start_time:.2f}s."
-        )
-        
-        # Transform Source 1 queries
-        X_s1 = vectorizer.transform(s1_texts)
-        
-        # Transpose target matrix once for efficient CSR dot product
-        X_target_T = X_target.T.tocsr()
-        target_ids_arr = np.asarray(target_ids)
-        
-        # 2. Batched sparse matrix multiplication
-        total_candidates_found = 0
-        match_time = time.time()
-        
-        for start_idx in range(0, n_s1, self.batch_size):
-            end_idx = min(start_idx + self.batch_size, n_s1)
-            X_batch = X_s1[start_idx:end_idx]
-            
-            # Compute sparse dot product: (batch_size x vocab) @ (vocab x n_target)
-            sim_batch: sparse.csr_matrix = X_batch.dot(X_target_T)
-            
-            # Extract top-K candidates directly from CSR matrix buffers
-            indptr = sim_batch.indptr
-            indices = sim_batch.indices
-            data = sim_batch.data
-            
-            for row_i in range(end_idx - start_idx):
-                global_s1_idx = start_idx + row_i
-                s1_id = s1_ids[global_s1_idx]
-                
-                row_start = indptr[row_i]
-                row_end = indptr[row_i + 1]
-                
-                if row_start == row_end:
-                    continue  # Zero overlap with any target document
-                
-                row_indices = indices[row_start:row_end]
-                row_scores = data[row_start:row_end]
-                
-                # Apply similarity threshold filter
-                valid_mask = row_scores >= self.min_similarity
-                if not np.any(valid_mask):
+        s1_ids = s1_df_country["entity_id"].tolist()
+        s1_joint_texts = s1_df_country["clean_joint"].tolist()
+        target_ids = np.array(target_df_country["entity_id"].tolist())
+
+        candidates_map: Dict[str, List[str]] = {}
+        logger.info(f"[{country_name}] Querying {n_queries:,} S1 entities in batches of {self.batch_size:,}...")
+        query_start = time.time()
+
+        for batch_idx in range(0, n_queries, self.batch_size):
+            batch_end = min(batch_idx + self.batch_size, n_queries)
+            batch_texts = s1_joint_texts[batch_idx:batch_end]
+            batch_ids = s1_ids[batch_idx:batch_end]
+
+            # Transform query batch
+            query_matrix = vectorizer.transform(batch_texts)
+
+            # Sparse dot product: (batch_size x vocab) @ (vocab x n_targets) -> (batch_size x n_targets)
+            sim_matrix = query_matrix.dot(target_matrix_t).tocsr()
+
+            # Extract top-K per row
+            for row_idx, s1_id in enumerate(batch_ids):
+                row_start_ptr = sim_matrix.indptr[row_idx]
+                row_end_ptr = sim_matrix.indptr[row_idx + 1]
+
+                if row_start_ptr == row_end_ptr:
+                    candidates_map[s1_id] = []
                     continue
-                    
-                valid_indices = row_indices[valid_mask]
-                valid_scores = row_scores[valid_mask]
-                n_valid = len(valid_indices)
-                
+
+                col_indices = sim_matrix.indices[row_start_ptr:row_end_ptr]
+                sim_scores = sim_matrix.data[row_start_ptr:row_end_ptr]
+
+                # Filter by minimum similarity
+                valid_mask = sim_scores >= self.min_similarity
+                valid_indices = col_indices[valid_mask]
+                valid_scores = sim_scores[valid_mask]
+
+                n_valid = len(valid_scores)
+                if n_valid == 0:
+                    candidates_map[s1_id] = []
+                    continue
+
                 if n_valid <= self.top_k:
-                    # Sort top candidates descending by score
-                    sort_order = np.argsort(-valid_scores)
-                    selected_target_indices = valid_indices[sort_order]
+                    # Sort top candidates descending
+                    sorted_order = np.argsort(-valid_scores)
+                    chosen_target_ids = target_ids[valid_indices[sorted_order]].tolist()
                 else:
-                    # Efficient partial sort using argpartition
-                    partition_idx = np.argpartition(-valid_scores, self.top_k)[:self.top_k]
-                    sub_scores = valid_scores[partition_idx]
-                    sub_sort = np.argsort(-sub_scores)
-                    selected_target_indices = valid_indices[partition_idx[sub_sort]]
-                    
-                cand_ids = target_ids_arr[selected_target_indices].tolist()
-                results[s1_id] = cand_ids
-                total_candidates_found += len(cand_ids)
-                
-        elapsed = time.time() - match_time
-        non_empty_count = sum(1 for v in results.values() if v)
-        avg_cands = total_candidates_found / max(1, n_s1)
+                    # Partial sort for top-K
+                    top_part = np.argpartition(-valid_scores, self.top_k)[: self.top_k]
+                    sorted_top = top_part[np.argsort(-valid_scores[top_part])]
+                    chosen_target_ids = target_ids[valid_indices[sorted_top]].tolist()
+
+                candidates_map[s1_id] = chosen_target_ids
+
+        total_query_time = time.time() - query_start
         logger.info(
-            f"[{country}] Blocking complete in {elapsed:.2f}s. "
-            f"Matched {non_empty_count:,}/{n_s1:,} S1 entities ({avg_cands:.2f} cands/entity)."
+            f"[{country_name}] Candidate generation complete in {total_query_time:.2f}s "
+            f"({n_queries / total_query_time:.1f} queries/sec)"
         )
-        
-        return results
+        return candidates_map
 
     def generate_candidates(
         self,
-        source1_df: pd.DataFrame,
-        source2_df: pd.DataFrame,
-        source3_df: pd.DataFrame,
-        text_column: str = "norm_joint",
-        id_column: str = "entity_id",
-        country_column: str = "country",
+        df_s1: pd.DataFrame,
+        df_s2: pd.DataFrame,
+        df_s3: pd.DataFrame,
     ) -> Dict[str, List[str]]:
         """
-        Generate candidate pairs partitioned strictly by country.
-        
-        Args:
-            source1_df: Normalized DataFrame for Source 1.
-            source2_df: Normalized DataFrame for Source 2.
-            source3_df: Normalized DataFrame for Source 3.
-            text_column: Column name containing the text representation to match.
-            id_column: Column name containing the entity IDs.
-            country_column: Column name containing the country classification.
-            
-        Returns:
-            Dictionary mapping every Source 1 entity_id -> list of candidate target IDs.
+        Run complete blocking pipeline dynamically partitioned across all countries present.
         """
-        logger.info("Initializing multi-country candidate generation pipeline...")
-        
-        # Combine target sources into unified corpus
-        target_df = pd.concat(
-            [source2_df[[id_column, text_column, country_column]],
-             source3_df[[id_column, text_column, country_column]]],
-            ignore_index=True,
-        )
-        
+        logger.info("=" * 70)
+        logger.info("Starting Phase 2 Candidate Generation (Blocking)")
+        logger.info("=" * 70)
+
+        # 1. Preprocess dataframes with normalizer
+        logger.info("Preprocessing Source 1, Source 2, and Source 3 text payloads...")
+        t0 = time.time()
+        s1_prep = preprocess_dataframe(df_s1)
+        s2_prep = preprocess_dataframe(df_s2)
+        s3_prep = preprocess_dataframe(df_s3)
+        target_prep = pd.concat([s2_prep, s3_prep], ignore_index=True)
         logger.info(
-            f"Total Corpus: Source 1 = {len(source1_df):,} records, "
-            f"Target (S2 + S3) = {len(target_df):,} records."
+            f"Preprocessing completed in {time.time() - t0:.2f}s: "
+            f"S1={len(s1_prep):,}, S2={len(s2_prep):,}, S3={len(s3_prep):,}, Combined Target={len(target_prep):,}"
         )
-        
-        # Unique countries in Source 1
-        s1_countries = source1_df[country_column].dropna().unique()
+
+        # 2. Discover countries dynamically
+        countries = sorted(s1_prep["country"].dropna().unique())
+        logger.info(f"Discovered countries to process: {countries}")
+
         all_candidates: Dict[str, List[str]] = {}
-        
-        total_start = time.time()
-        for country in s1_countries:
-            s1_subset = source1_df[source1_df[country_column] == country]
-            target_subset = target_df[target_df[country_column] == country]
-            
-            s1_ids = s1_subset[id_column].tolist()
-            s1_texts = s1_subset[text_column].tolist()
-            
-            target_ids = target_subset[id_column].tolist()
-            target_texts = target_subset[text_column].tolist()
+
+        # 3. Process each country partition
+        for country in countries:
+            s1_country = s1_prep[s1_prep["country"] == country].reset_index(drop=True)
+            target_country = target_prep[target_prep["country"] == country].reset_index(drop=True)
+            logger.info(f"\n>>> Processing Country Partition: '{country}' (S1: {len(s1_country):,}, Targets: {len(target_country):,})")
             
             country_candidates = self.block_country_partition(
-                s1_ids=s1_ids,
-                s1_texts=s1_texts,
-                target_ids=target_ids,
-                target_texts=target_texts,
-                country=str(country),
+                s1_df_country=s1_country,
+                target_df_country=target_country,
+                country_name=str(country),
             )
             all_candidates.update(country_candidates)
-            
-        # Ensure any missing Source 1 IDs receive empty list
-        for s1_id in source1_df[id_column]:
-            if s1_id not in all_candidates:
-                all_candidates[s1_id] = []
-                
-        logger.info(
-            f"All partitions processed in {time.time() - total_start:.2f}s. "
-            f"Total S1 entities indexed: {len(all_candidates):,}."
-        )
+
         return all_candidates
 
 
-# ---------------------------------------------------------------------------
-# Submission-Compliant Export Function
-# ---------------------------------------------------------------------------
-
-def export_candidate_pairs(
-    candidates_dict: Dict[str, List[str]],
-    output_path: str = "output/candidate_pairs.tsv",
-    all_s1_ids: Optional[Sequence[str]] = None,
-) -> str:
+def export_candidate_pairs(candidates_dict: Dict[str, List[str]], output_path: str) -> None:
     """
-    Export candidate pairs to TSV adhering strictly to the competition format.
-    
-    Validation Guarantees:
-      - Tab-separated header: source1_entity_id\\tcandidate_entity_ids
-      - Exactly one row per required Source 1 entity.
-      - Candidate IDs formatted as comma-separated list without quotes or spaces.
-      - Empty string in candidate column for singletons / unmatched entities.
-      - Zero self-matches (S1- IDs).
-      - UTF-8 encoding.
-      
-    Args:
-        candidates_dict: Mapping of s1_entity_id -> list of candidate IDs.
-        output_path: Destination path for the TSV file.
-        all_s1_ids: Optional ordered list of required Source 1 IDs. If provided,
-                    the output file will follow this exact row order.
-                    
-    Returns:
-        Absolute path to the created candidate pairs file.
+    Export candidate pairs TSV file strictly matching the official schema.
+    Header: source1_entity_id\tcandidate_entity_ids
     """
-    # Create target directory if needed
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    logger.info(f"Writing {len(candidates_dict):,} candidate rows to {output_path}...")
     
-    # Determine the complete ordered sequence of S1 IDs
-    if all_s1_ids is not None:
-        ordered_ids = all_s1_ids
-    else:
-        ordered_ids = list(candidates_dict.keys())
-        
-    logger.info(f"Exporting candidate pairs for {len(ordered_ids):,} entities to: {output_path}")
-    
-    total_written = 0
-    non_empty_count = 0
-    
-    with open(output_path, "w", encoding="utf-8", newline="") as f:
-        # Write exact required header
+    with open(output_path, "w", encoding="utf-8") as f:
         f.write("source1_entity_id\tcandidate_entity_ids\n")
-        
-        for s1_id in ordered_ids:
-            cands = candidates_dict.get(s1_id, [])
-            
-            # Filter any accidental self-matches (safety check)
-            clean_cands = [c for c in cands if not c.startswith("S1-")]
-            
-            if clean_cands:
-                cand_str = ",".join(clean_cands)
-                non_empty_count += 1
-            else:
-                cand_str = ""
-                
+        for s1_id, cands in candidates_dict.items():
+            cand_str = ",".join(cands)
             f.write(f"{s1_id}\t{cand_str}\n")
-            total_written += 1
             
-    logger.info(
-        f"Export successful. Written {total_written:,} rows "
-        f"({non_empty_count:,} non-empty, {total_written - non_empty_count:,} empty singletons)."
-    )
-    return os.path.abspath(output_path)
+    logger.info(f"Export completed: {output_path}")
 
 
-# ---------------------------------------------------------------------------
-# High-Level Blocking Pipeline Runner
-# ---------------------------------------------------------------------------
-
-def run_blocking_pipeline(
-    s1_path: str,
-    s2_path: str,
-    s3_path: str,
-    output_path: str = "output/candidate_pairs.tsv",
-    top_k: int = 35,
-    min_similarity: float = 0.15,
-) -> Dict[str, List[str]]:
+def evaluate_candidate_recall(
+    candidates_dict: Dict[str, List[str]],
+    ground_truth_path: str,
+) -> Dict[str, float]:
     """
-    Load raw TSV files, normalize them, run TF-IDF blocking, and export candidate TSV.
+    Compute candidate recall ceiling and blocking efficiency metrics against ground truth.
+    """
+    logger.info(f"Evaluating candidate recall ceiling against {ground_truth_path}...")
+    gt_df = pd.read_csv(ground_truth_path, sep="\t", keep_default_na=False)
     
-    Args:
-        s1_path: Path to source1.tsv.
-        s2_path: Path to source2.tsv.
-        s3_path: Path to source3.tsv.
-        output_path: Path to candidate_pairs.tsv.
-        top_k: Top K candidates per entity.
-        min_similarity: Cosine similarity cutoff.
+    total_gt_pairs = 0
+    captured_gt_pairs = 0
+    total_candidates = 0
+    s1_count = len(candidates_dict)
+    zero_candidates_count = 0
+    singletons_count = 0
+
+    for _, row in gt_df.iterrows():
+        s1_id = row["source1_entity_id"]
+        raw_m = row["matched_entity_ids"]
+        true_matches = set(m.strip() for m in str(raw_m).split(",") if m.strip())
         
-    Returns:
-        Generated candidates dictionary.
-    """
-    logger.info(f"Loading data: S1='{s1_path}', S2='{s2_path}', S3='{s3_path}'")
-    
-    # Load raw TSV files
-    df_s1 = pd.read_csv(s1_path, sep="\t", encoding="utf-8")
-    df_s2 = pd.read_csv(s2_path, sep="\t", encoding="utf-8")
-    df_s3 = pd.read_csv(s3_path, sep="\t", encoding="utf-8")
-    
-    # Normalize datasets
-    logger.info("Normalizing Source 1...")
-    df_s1 = normalize_dataframe(df_s1)
-    logger.info("Normalizing Source 2...")
-    df_s2 = normalize_dataframe(df_s2)
-    logger.info("Normalizing Source 3...")
-    df_s3 = normalize_dataframe(df_s3)
-    
-    # Initialize Blocker
-    blocker = TFIDFBlocker(
-        ngram_range=(3, 4),
-        analyzer="char_wb",
-        min_df=2,
-        top_k=top_k,
-        min_similarity=min_similarity,
+        cands = set(candidates_dict.get(s1_id, []))
+        total_candidates += len(cands)
+        if len(cands) == 0:
+            zero_candidates_count += 1
+
+        if not true_matches:
+            singletons_count += 1
+            continue
+
+        total_gt_pairs += len(true_matches)
+        captured_gt_pairs += len(true_matches.intersection(cands))
+
+    recall_ceiling = (captured_gt_pairs / total_gt_pairs * 100.0) if total_gt_pairs > 0 else 100.0
+    avg_candidates = total_candidates / s1_count if s1_count > 0 else 0.0
+
+    print("\n" + "=" * 70)
+    print("PHASE 2 BLOCKING CANDIDATE EVALUATION REPORT")
+    print("=" * 70)
+    print(f"Total S1 Entities Evaluated:      {s1_count:,}")
+    print(f"Total Ground Truth Matches:       {total_gt_pairs:,}")
+    print(f"Captured Ground Truth Matches:    {captured_gt_pairs:,}")
+    print(f"Candidate Recall Ceiling:         {recall_ceiling:.3f}%")
+    print(f"Average Candidates per S1:        {avg_candidates:.2f}")
+    print(f"Singletons in Ground Truth:       {singletons_count:,} ({(singletons_count/s1_count)*100:.2f}%)")
+    print(f"Entities with Zero Candidates:    {zero_candidates_count:,} ({(zero_candidates_count/s1_count)*100:.2f}%)")
+    print("=" * 70 + "\n")
+
+    return {
+        "recall_ceiling": recall_ceiling,
+        "avg_candidates": avg_candidates,
+        "total_gt_pairs": total_gt_pairs,
+        "captured_gt_pairs": captured_gt_pairs,
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Phase 2 Scalable Sparse TF-IDF Blocking Engine"
     )
-    
-    # Generate candidates
-    candidates = blocker.generate_candidates(
-        source1_df=df_s1,
-        source2_df=df_s2,
-        source3_df=df_s3,
+    parser.add_argument("--s1", default="sample_data/sample_source1.tsv", help="Source 1 TSV path")
+    parser.add_argument("--s2", default="sample_data/sample_source2.tsv", help="Source 2 TSV path")
+    parser.add_argument("--s3", default="sample_data/sample_source3.tsv", help="Source 3 TSV path")
+    parser.add_argument("--gt", default="sample_data/sample_ground_truth.tsv", help="Ground Truth TSV path (optional)")
+    parser.add_argument("--out", default="output/candidate_pairs.tsv", help="Output candidate TSV path")
+    parser.add_argument("--top-k", type=int, default=35, help="Top-K candidates per entity")
+    parser.add_argument("--min-sim", type=float, default=0.12, help="Minimum cosine similarity threshold")
+    parser.add_argument("--batch-size", type=int, default=5000, help="Batch query size")
+    args = parser.parse_args()
+
+    start_total = time.time()
+    logger.info(f"Loading datasets: S1={args.s1}, S2={args.s2}, S3={args.s3}...")
+    df_s1 = pd.read_csv(args.s1, sep="\t", keep_default_na=False)
+    df_s2 = pd.read_csv(args.s2, sep="\t", keep_default_na=False)
+    df_s3 = pd.read_csv(args.s3, sep="\t", keep_default_na=False)
+
+    blocker = DynamicTFIDFBlocker(
+        top_k=args.top_k,
+        min_similarity=args.min_sim,
+        batch_size=args.batch_size,
     )
-    
-    # Export compliant TSV
-    export_candidate_pairs(
-        candidates_dict=candidates,
-        output_path=output_path,
-        all_s1_ids=df_s1["entity_id"].tolist(),
-    )
-    
-    return candidates
+    candidates_dict = blocker.generate_candidates(df_s1, df_s2, df_s3)
+
+    export_candidate_pairs(candidates_dict, args.out)
+
+    if args.gt and os.path.isfile(args.gt):
+        evaluate_candidate_recall(candidates_dict, args.gt)
+
+    logger.info(f"Total blocking runtime: {time.time() - start_total:.2f}s")
+
+
+if __name__ == "__main__":
+    main()
