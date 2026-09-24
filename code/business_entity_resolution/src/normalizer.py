@@ -1,25 +1,26 @@
 """
-Text normalization module for Business Entity Resolution.
+Phase 1: Data Normalization & Cleaning Module for Business Entity Resolution.
 
-Provides deterministic cleaning, Unicode diacritics stripping (NFKD),
-legal entity suffix removal, address abbreviation expansions, and
-memory-efficient vectorized application over pandas DataFrames.
+Provides deterministic string cleaning, Unicode NFKD diacritics stripping (supporting
+English, Indian, and French datasets), legal entity suffix removal, address contraction
+expansion, missing address fallback handling, and memory-efficient DataFrame preprocessing.
 """
 
 from __future__ import annotations
 
 import re
 import unicodedata
-from typing import Optional
+from typing import Optional, Union
 import pandas as pd
 
 
 # ---------------------------------------------------------------------------
-# Precompiled Regex Patterns for High Performance
+# Precompiled Regex Patterns for Maximum Throughput
 # ---------------------------------------------------------------------------
 
-# Legal Entity Suffixes to remove from business names
-# Ordered by descending length to prevent partial prefix/substring collisions
+# Legal Entity Suffixes to remove from business names across US, India, and France
+# Sorted by descending token length to ensure longer phrases (e.g., 'private limited')
+# are matched prior to single-token substrings (e.g., 'ltd')
 LEGAL_SUFFIXES = [
     r"private\s+limited",
     r"pvt\s+ltd",
@@ -27,31 +28,54 @@ LEGAL_SUFFIXES = [
     r"corporation",
     r"enterprises",
     r"associates",
+    r"industries",
+    r"solutions",
+    r"services",
     r"limited",
     r"company",
     r"pvt",
     r"ltd",
     r"inc",
     r"corp",
+    r"l\.?l\.?c\.?",
+    r"l\s+l\s+c",
     r"llc",
+    r"l\.?l\.?p\.?",
+    r"l\s+l\s+p",
     r"llp",
+    r"p\.?l\.?l\.?c\.?",
+    r"pllc",
+    r"s\.?a\.?r\.?l\.?",
+    r"s\s+a\s+r\s+l",
     r"sarl",
+    r"s\.?a\.?s\.?u\.?",
+    r"s\s+a\s+s\s+u",
     r"sasu",
+    r"e\.?u\.?r\.?l\.?",
+    r"e\s+u\s+r\s+l",
     r"eurl",
+    r"s\.?a\.?s\.?",
+    r"s\s+a\s+s",
     r"sas",
     r"gmbh",
+    r"s\.?a\.?",
+    r"s\s+a",
     r"sa",
+    r"sci",
+    r"snc",
+    r"gie",
+    r"c\s+o",
     r"co",
 ]
+
 LEGAL_SUFFIX_REGEX = re.compile(
     rf"\b({'|'.join(LEGAL_SUFFIXES)})\b",
     flags=re.IGNORECASE,
 )
 
-# Address abbreviations and directional expansions
-# Applied with word boundary matches to avoid false positives
-ADDRESS_ABBREVIATIONS = {
-    # Road / Street types
+# Address contractions and directional expansions
+ADDRESS_CONTRACTIONS = {
+    # Primary Road / Street types
     r"\brd\b": "road",
     r"\bst\b": "street",
     r"\bave\b": "avenue",
@@ -67,7 +91,10 @@ ADDRESS_ABBREVIATIONS = {
     r"\bhwy\b": "highway",
     r"\brte\b": "route",
     r"\br\b": "rue",
-    # Unit / Sub-division tokens
+    # Landmark and unit indicators
+    r"\bopp\b": "opposite",
+    r"\bb/h\b": "behind",
+    r"\bnr\b": "near",
     r"\bapt\b": "apartment",
     r"\bflt\b": "flat",
     r"\bste\b": "suite",
@@ -75,10 +102,7 @@ ADDRESS_ABBREVIATIONS = {
     r"\bfl\b": "floor",
     r"\bh\.?no\.?\b": "house number",
     r"\bhno\b": "house number",
-    r"\bb/h\b": "behind",
-    r"\bopp\b": "opposite",
-    r"\bnr\b": "near",
-    # Compass directions
+    # Cardinal directions
     r"\bn\b": "north",
     r"\bs\b": "south",
     r"\be\b": "east",
@@ -89,20 +113,13 @@ ADDRESS_ABBREVIATIONS = {
     r"\bsw\b": "southwest",
 }
 
-ADDRESS_EXPANSION_PATTERNS = [
+ADDRESS_CONTRACTION_PATTERNS = [
     (re.compile(pattern, flags=re.IGNORECASE), replacement)
-    for pattern, replacement in ADDRESS_ABBREVIATIONS.items()
+    for pattern, replacement in ADDRESS_CONTRACTIONS.items()
 ]
 
-# Common symbol replacements
-SYMBOL_REPLACEMENTS = [
-    (re.compile(r"&"), " and "),
-    (re.compile(r"@"), " at "),
-    (re.compile(r"\+"), " plus "),
-    (re.compile(r"[/\\_]"), " "),
-]
-
-# Non-alphanumeric strip and whitespace collapse
+# Character cleaning & whitespace regexes
+AMPERSAND_REGEX = re.compile(r"&")
 NON_ALPHANUMERIC_REGEX = re.compile(r"[^a-z0-9\s]")
 WHITESPACE_REGEX = re.compile(r"\s+")
 
@@ -111,105 +128,154 @@ WHITESPACE_REGEX = re.compile(r"\s+")
 # Core Normalization Functions
 # ---------------------------------------------------------------------------
 
-def strip_diacritics(text: str) -> str:
+def normalize_text(s: Optional[Union[str, float]]) -> str:
     """
-    Decompose Unicode characters into ASCII base characters and accents (NFKD),
-    then discard combining diacritical marks.
+    Normalize text via Unicode NFKD decomposition, lowercase conversion,
+    ampersand replacement, and non-alphanumeric removal.
     
-    Handles French accented characters in test set (e.g., 'École' -> 'Ecole', 'Château' -> 'Chateau').
-    """
-    if not text:
-        return ""
-    # Normalize with NFKD decomposition and filter non-spacing marks
-    normalized = unicodedata.normalize("NFKD", text)
-    return "".join(c for c in normalized if not unicodedata.combining(c))
-
-
-def normalize_business_name(text: Optional[str]) -> str:
-    """
-    Normalize business entity name.
-    
-    Steps:
-      1. Handle nulls and convert to string.
-      2. Unicode NFKD decomposition to strip accents / diacritics.
-      3. Lowercase text and expand symbols ('&' -> 'and', '@' -> 'at', etc.).
-      4. Strip legal suffixes (e.g., LLC, Pvt Ltd, Inc, SARL, SAS, GmbH).
-      5. Remove special punctuation while preserving alphanumerics and single spaces.
-      6. Collapse whitespace and strip leading/trailing spaces.
+    Handles accented Latin characters in French test records (e.g., 'é' -> 'e', 'ç' -> 'c').
     
     Args:
-        text: Raw business name string.
+        s: Raw input text string or missing value.
         
     Returns:
-        Cleaned, canonical business name string.
+        Cleaned lowercase ASCII-alphanumeric string.
     """
-    if text is None or not isinstance(text, str):
+    if s is None or not isinstance(s, str):
         return ""
     
-    # 1. Unicode decomposition & diacritics removal
-    text = strip_diacritics(text)
+    # NFKD decomposition to separate base letters from diacritical marks
+    decomposed = unicodedata.normalize("NFKD", s)
+    stripped = "".join(c for c in decomposed if not unicodedata.combining(c))
     
-    # 2. Lowercase
-    text = text.lower()
+    # Lowercase conversion
+    text = stripped.lower()
     
-    # 3. Symbol replacements
-    for pattern, replacement in SYMBOL_REPLACEMENTS:
-        text = pattern.sub(replacement, text)
-        
-    # 4. Remove legal entity suffixes using word boundaries
-    text = LEGAL_SUFFIX_REGEX.sub(" ", text)
+    # Replace ampersands with 'and'
+    text = AMPERSAND_REGEX.sub(" and ", text)
     
-    # 5. Remove special characters / punctuation
+    # Replace non-alphanumeric characters with spaces
     text = NON_ALPHANUMERIC_REGEX.sub(" ", text)
     
-    # 6. Collapse multiple spaces
-    text = WHITESPACE_REGEX.sub(" ", text).strip()
-    
-    return text
+    # Collapse multiple whitespace characters into a single space
+    return WHITESPACE_REGEX.sub(" ", text).strip()
 
 
-def normalize_address(text: Optional[str]) -> str:
+def clean_legal_suffixes(s: Optional[Union[str, float]]) -> str:
     """
-    Normalize business address.
+    Remove corporate designations and legal entity suffixes across US, Indian,
+    and French business jurisdictions using word boundary matching.
     
-    Steps:
-      1. Handle nulls and convert to string.
-      2. Unicode NFKD decomposition to strip accents / diacritics.
-      3. Lowercase text and expand symbols.
-      4. Expand common address contractions (e.g., rd -> road, st -> street, blvd -> boulevard).
-      5. Remove commas, periods, and special punctuation.
-      6. Collapse whitespace and strip leading/trailing spaces.
+    Args:
+        s: Business name string.
+        
+    Returns:
+        Business name with legal entity suffixes removed.
+    """
+    if not s or not isinstance(s, str):
+        return ""
+    cleaned = LEGAL_SUFFIX_REGEX.sub(" ", s)
+    return WHITESPACE_REGEX.sub(" ", cleaned).strip()
+
+
+def clean_address(s: Optional[Union[str, float]]) -> str:
+    """
+    Clean business address, expanding contractions and handling NaN/missing values.
+    
+    Args:
+        s: Raw address string or missing value.
+        
+    Returns:
+        Cleaned and expanded address string, or empty string if missing.
+    """
+    if s is None or not isinstance(s, str):
+        return ""
+    
+    # NFKD decomposition and lowercase
+    decomposed = unicodedata.normalize("NFKD", s)
+    stripped = "".join(c for c in decomposed if not unicodedata.combining(c))
+    text = stripped.lower()
+    
+    # Replace ampersands
+    text = AMPERSAND_REGEX.sub(" and ", text)
+    
+    # Expand address contractions
+    for pattern, replacement in ADDRESS_CONTRACTION_PATTERNS:
+        text = pattern.sub(replacement, text)
+        
+    # Replace non-alphanumeric punctuation
+    text = NON_ALPHANUMERIC_REGEX.sub(" ", text)
+    
+    # Collapse whitespace
+    return WHITESPACE_REGEX.sub(" ", text).strip()
+
+
+def preprocess_dataframe(
+    df: pd.DataFrame,
+    name_col: str = "business_name",
+    addr_col: str = "business_address",
+    inplace: bool = False,
+) -> pd.DataFrame:
+    """
+    Preprocess an entity DataFrame with vectorized high-speed string normalization.
+    
+    Adds the following processed columns:
+      - 'clean_name': Normalized name stripped of legal entity suffixes.
+      - 'clean_addr': Normalized and expanded address (empty string if NaN).
+      - 'is_addr_missing': Binary indicator (1 if original address was null/blank, 0 otherwise).
+      - 'clean_joint': Weighted composite string ('clean_name clean_name clean_addr') for TF-IDF blocking.
       
     Args:
-        text: Raw address string.
+        df: Input DataFrame containing entity records.
+        name_col: Column name containing business names.
+        addr_col: Column name containing business addresses.
+        inplace: Whether to mutate input DataFrame or return a shallow copy.
         
     Returns:
-        Cleaned, canonical address string.
+        Preprocessed DataFrame with cleaned text and indicator columns.
     """
-    if text is None or not isinstance(text, str):
-        return ""
+    target_df = df if inplace else df.copy(deep=False)
     
-    # 1. Unicode decomposition & diacritics removal
-    text = strip_diacritics(text)
-    
-    # 2. Lowercase
-    text = text.lower()
-    
-    # 3. Symbol replacements
-    for pattern, replacement in SYMBOL_REPLACEMENTS:
-        text = pattern.sub(replacement, text)
+    # 1. Address missing indicator
+    if addr_col in target_df.columns:
+        addr_series = target_df[addr_col]
+        target_df["is_addr_missing"] = (
+            addr_series.isna() | (addr_series.astype(str).str.strip() == "") | (addr_series.astype(str).str.lower() == "nan")
+        ).astype(int)
+        raw_addrs = addr_series.fillna("").astype(str).tolist()
+    else:
+        target_df["is_addr_missing"] = 1
+        raw_addrs = [""] * len(target_df)
         
-    # 4. Expand address abbreviations
-    for pattern, replacement in ADDRESS_EXPANSION_PATTERNS:
-        text = pattern.sub(replacement, text)
+    # 2. Extract and process names
+    if name_col in target_df.columns:
+        raw_names = target_df[name_col].fillna("").astype(str).tolist()
+    else:
+        raw_names = [""] * len(target_df)
         
-    # 5. Remove non-alphanumeric punctuation
-    text = NON_ALPHANUMERIC_REGEX.sub(" ", text)
+    # Apply fast list comprehension transforms
+    clean_names = [clean_legal_suffixes(normalize_text(name)) for name in raw_names]
+    clean_addrs = [clean_address(addr) for addr in raw_addrs]
     
-    # 6. Collapse multiple spaces
-    text = WHITESPACE_REGEX.sub(" ", text).strip()
+    target_df["clean_name"] = clean_names
+    target_df["clean_addr"] = clean_addrs
     
-    return text
+    # 3. Create weighted joint text (giving name 2x weighting for blocking recall)
+    target_df["clean_joint"] = [
+        f"{n} {n} {a}".strip() if a else f"{n} {n}".strip()
+        for n, a in zip(clean_names, clean_addrs)
+    ]
+    
+    return target_df
+
+
+# ---------------------------------------------------------------------------
+# Compatibility Aliases for Downstream Modules
+# ---------------------------------------------------------------------------
+
+def normalize_business_name(text: Optional[str]) -> str:
+    """Compatibility alias for clean_legal_suffixes(normalize_text(text))."""
+    return clean_legal_suffixes(normalize_text(text))
 
 
 def normalize_dataframe(
@@ -220,49 +286,11 @@ def normalize_dataframe(
     inplace: bool = False,
 ) -> pd.DataFrame:
     """
-    Memory-efficient vectorized normalization of business names and addresses
-    across a pandas DataFrame.
-    
-    Uses optimized list comprehensions (2x faster than Series.apply with less memory overhead)
-    and handles missing/null values gracefully.
-    
-    Args:
-        df: Input DataFrame containing entity records.
-        name_col: Name of column containing business name.
-        addr_col: Name of column containing business address.
-        create_joint: If True, creates a concatenated 'norm_joint' column for blocking.
-        inplace: Whether to modify input DataFrame in place or return a shallow copy.
-        
-    Returns:
-        DataFrame with normalized columns:
-          - 'norm_business_name'
-          - 'norm_business_address'
-          - 'norm_joint' (if create_joint is True)
+    Compatibility wrapper mapping to preprocess_dataframe with alias column names.
     """
-    target_df = df if inplace else df.copy(deep=False)
-    
-    # Extract string values with null handling
-    names = target_df[name_col].fillna("").astype(str).tolist() if name_col in target_df.columns else []
-    addresses = target_df[addr_col].fillna("").astype(str).tolist() if addr_col in target_df.columns else []
-    
-    # Process business names
-    if names:
-        target_df["norm_business_name"] = [normalize_business_name(name) for name in names]
-    else:
-        target_df["norm_business_name"] = ""
-        
-    # Process addresses
-    if addresses:
-        target_df["norm_business_address"] = [normalize_address(addr) for addr in addresses]
-    else:
-        target_df["norm_business_address"] = ""
-        
-    # Create combined joint string for fast TF-IDF indexing
+    res = preprocess_dataframe(df, name_col=name_col, addr_col=addr_col, inplace=inplace)
+    res["norm_business_name"] = res["clean_name"]
+    res["norm_business_address"] = res["clean_addr"]
     if create_joint:
-        norm_names = target_df["norm_business_name"].tolist()
-        norm_addrs = target_df["norm_business_address"].tolist()
-        target_df["norm_joint"] = [
-            f"{n} {a}".strip() for n, a in zip(norm_names, norm_addrs)
-        ]
-        
-    return target_df
+        res["norm_joint"] = res["clean_joint"]
+    return res
