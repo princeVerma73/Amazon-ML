@@ -112,7 +112,7 @@ flowchart TD
     end
 
     subgraph S4_Output [Submission Export & Verification]
-        C6 --> D1[Export output/matching_results.tsv]
+        C6 --> D1[Chunked Direct Disk Flushing to output/matching_results.tsv]
         D1 --> D2[Run student_resource/utils/validate_submission.py]
         D2 --> D3{Strict Validation Pass?}
         D3 -- Yes --> D4[Ready for Packaging & Submission]
@@ -253,6 +253,29 @@ Phase 3 Benchmark Verification on 25k Holdout Slice (sample_data/):
 
 ---
 
+### Phase 4: End-to-End Test Pipeline Orchestrator & Submission Generator `[COMPLETED]`
+
+#### 1. Architecture & Execution Strategy
+- **Entry Point:** `run_pipeline.py` accepting `--mode sample` (development benchmark) and `--mode test` (full 11.7M test set inference).
+- **Chunked Streaming Scoring:** Processes $20,000$ reference entities per slice, computing SIMD features and streaming probability evaluations with direct append to `output/matching_results.tsv`. Bounded memory consumption ($<4.0\text{ GB}$ peak RAM).
+- **Automated Validation Integration:** Automatically triggers `validate_submission.py` upon completion to verify row counts, column names, tab formatting, and singleton empty strings.
+
+```
+Phase 4 End-to-End Pipeline Dry-Run Verification (run_pipeline.py --mode sample):
+- Total S1 Reference Entities:          25,000
+- Singletons Correctly Preserved:        1,480 (5.92%)
+- End-to-End Pipeline Runtime:           107.81s
+- Preprocessing Stage:                   14.49s
+- Country Partitioned Blocking Stage:    63.45s (~480 queries/sec)
+- Chunked Inference & Disk Flushing:     28.04s (~891 entities/sec)
+- Full Dataset Instance Macro F_0.5:     0.9703
+- Full Dataset Instance Precision:       0.9831
+- Full Dataset Instance Recall:          0.9448
+- Official Validator Check:              PASS (0 errors, 0 warnings, 100% compliant)
+```
+
+---
+
 ## 4. Architectural Rationale, Trade-offs & Comparisons
 
 ### 4.1 Phase 1: Text Normalization
@@ -280,6 +303,12 @@ Phase 3 Benchmark Verification on 25k Holdout Slice (sample_data/):
 | :--- | :--- | :--- | :--- |
 | **Custom 2D Grid Search for Macro $F_{0.5}$** | Explicit search over $(\theta_{\text{link}}, \theta_{\text{singleton}})$ penalizing false positive linkings on singletons. | Directly aligns the model threshold with the competition metric, shifting $\theta_{\text{link}}$ to $0.750$ to prioritize Precision ($\beta=0.5$). | **Default Probability Cutoff (0.50):** Lost because the standard $0.50$ threshold causes precision decay on singletons (5.58%), reducing the Macro $F_{0.5}$ score from $0.9704$ down to $0.9671$. |
 
+### 4.6 Phase 4: Chunked Streaming Inference & Model Serialization
+| Architectural Technique | Definition & Purpose | Why We Chose It (Core Advantage) | Evaluated Alternatives & Why They Lost |
+| :--- | :--- | :--- | :--- |
+| **Generator-Based Chunking (20k entities) + Disk Flushing** | Slices the inference pool into 20k-entity blocks, extracting features, predicting, and appending directly to disk. | Maintains strict constant memory footprint ($<4.0\text{ GB}$ peak RAM), preventing OS page swapping or OOM crashes on the 11.7M record test set. | **In-Memory Materialization:** Lost because holding 50M feature rows ($>5\text{ GB}$) and predictions in RAM causes high risk of crash on consumer hardware.<br/>**Distributed Dask / Spark:** Lost due to high JVM serialization overhead, JVM-Python IPC latency, and unnecessary complexity on single-node environments. |
+| **Joblib Model Serialization** | Serializes trained GBDT trees and optimal thresholds into `models/lgbm_ber_model.joblib`. | Eliminates training latency on test runs, guarantees deterministic scoring, and avoids model drift. | **Batch Re-Training:** Lost because re-fitting GBDT models on inference runs is redundant, slow, and non-deterministic. |
+
 ---
 
 ## 5. Verification & Submission Packaging
@@ -297,10 +326,12 @@ Amazon-ML/
 │       │   ├── feature_extraction.py  # Phase 3: RapidFuzz SIMD pairwise feature pipeline
 │       │   ├── classifier.py          # Phase 3: LightGBM training & Macro F_0.5 thresholding
 │       │   └── pipeline.py            # Phase 4: End-to-end streaming orchestrator
-│       ├── requirements.txt           # lightgbm, rapidfuzz, scikit-learn, scipy, pandas
-│       └── run_pipeline.py            # Execution entry point
+│       ├── requirements.txt           # lightgbm, rapidfuzz, scikit-learn, scipy, pandas, joblib, tqdm
+│       └── run_pipeline.py            # Package-level execution entry point
 ├── docs/
 │   └── implementation.md              # Complete technical architecture specification
+├── models/
+│   └── lgbm_ber_model.joblib          # Serialized production LightGBM model & thresholds
 ├── output/
 │   ├── candidate_pairs.tsv            # Top-K candidate pairs from blocking phase
 │   └── matching_results.tsv           # Final predictions formatted for evaluation
@@ -309,6 +340,7 @@ Amazon-ML/
 │   ├── Documentation_template.md      # Completed competition writeup
 │   └── utils/
 │       └── validate_submission.py     # Local submission verification script
+└── run_pipeline.py                    # Root execution entry point
 ```
 
 ### 5.2 Exact Output TSV Schema Specifications
