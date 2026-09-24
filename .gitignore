@@ -1,0 +1,73 @@
+# ==========================================
+# Competition Datasets & Archives (Heavy Files)
+# ==========================================
+*.zip
+*.tar.gz
+*.tsv
+*.csv
+dataset/
+student_resource/dataset/
+student_resource/*.zip
+
+# Keep sample output if needed, but ignore raw large datasets
+!dataset/sample_*.csv
+!dataset/sample_*.tsv
+
+# ==========================================
+# macOS Metadata Junk (Visible in explorer)
+# ==========================================
+__MACOSX/
+._*
+.DS_Store
+**/.DS_Store
+**/._*
+
+# ==========================================
+# Output & Intermediates
+# ==========================================
+output/*.tsv
+intermediate/
+data_cache/
+*.parquet
+*.feather
+*.pkl
+*.joblib
+
+# ==========================================
+# Python / Virtual Environments
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# ==========================================
+# IDEs & Editors
+# ==========================================
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+.ipynb_checkpoints
+*/.ipynb_checkpoints/*
+
