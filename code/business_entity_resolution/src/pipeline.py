@@ -52,16 +52,22 @@ logger = logging.getLogger(__name__)
 
 def train_and_cache_model(
     sample_dir: str = "sample_data",
-    model_save_path: str = "models/lgbm_ber_model.joblib",
+    model_save_path: str = "models/xgb_ber_model.joblib",
 ) -> BERClassifier:
     """
-    Train and serialize the production LightGBM classifier on the benchmark sample dataset.
+    Train and serialize the production XGBoost classifier on the benchmark sample dataset.
     """
     if os.path.isfile(model_save_path):
-        logger.info(f"Loading cached trained model from {model_save_path}...")
-        clf = joblib.load(model_save_path)
-        logger.info(f"Model loaded successfully (th_link={clf.best_th_link:.3f}, th_singleton={clf.best_th_singleton:.3f})")
-        return clf
+        logger.info(f"Checking cached trained model from {model_save_path}...")
+        try:
+            clf = joblib.load(model_save_path)
+            if hasattr(clf, "model"):
+                logger.info(
+                    f"Model loaded successfully (th_link={clf.best_th_link:.3f}, th_singleton={clf.best_th_singleton:.3f})"
+                )
+                return clf
+        except Exception as e:
+            logger.warning(f"Failed to load cached model ({e}). Retraining...")
 
     logger.info(f"Training production model using benchmark data in '{sample_dir}'...")
     os.makedirs(os.path.dirname(os.path.abspath(model_save_path)), exist_ok=True)
@@ -75,9 +81,16 @@ def train_and_cache_model(
     df_s2 = pd.read_csv(s2_path, sep="\t", keep_default_na=False)
     df_s3 = pd.read_csv(s3_path, sep="\t", keep_default_na=False)
 
-    # 1. Blocking on sample
-    blocker = DynamicTFIDFBlocker(top_k=35, min_similarity=0.12, batch_size=5000)
-    cand_dict = blocker.generate_candidates(df_s1, df_s2, df_s3)
+    cand_tsv = os.path.join(sample_dir, "sample_candidate_pairs.tsv")
+    if os.path.isfile(cand_tsv):
+        cand_df = pd.read_csv(cand_tsv, sep="\t", keep_default_na=False)
+        cand_dict = {
+            row["source1_entity_id"]: [c.strip() for c in str(row["candidate_entity_ids"]).split(",") if c.strip()]
+            for _, row in cand_df.iterrows()
+        }
+    else:
+        blocker = DynamicTFIDFBlocker(top_k=20, min_similarity=0.10, batch_size=5000)
+        cand_dict = blocker.generate_candidates(df_s1, df_s2, df_s3)
 
     # 2. Preprocess and feature extraction
     s1_prep = preprocess_dataframe(df_s1)
@@ -89,11 +102,8 @@ def train_and_cache_model(
     gt_map = parse_ground_truth(gt_path)
 
     # 3. Train classifier
-    clf = BERClassifier(learning_rate=0.08, num_leaves=31, n_estimators=300)
-    clf.train_and_evaluate(meta_df, feats_df, gt_map, test_size=0.20)
-
-    logger.info(f"Saving serialized model to {model_save_path}...")
-    joblib.dump(clf, model_save_path)
+    clf = BERClassifier()
+    clf.train_and_evaluate(meta_df, feats_df, gt_map, test_size=0.20, checkpoint_path=model_save_path)
     return clf
 
 
@@ -120,68 +130,97 @@ def stream_scoring_and_export(
         Full predictions map for evaluation or telemetry.
     """
     os.makedirs(os.path.dirname(os.path.abspath(output_matching_path)), exist_ok=True)
-    logger.info(f"Starting chunked scoring for {len(s1_prep):,} reference entities (chunk_size={chunk_size:,})...")
-
     all_s1_ids = s1_prep["entity_id"].tolist()
     total_entities = len(all_s1_ids)
+    total_chunks = (total_entities + chunk_size - 1) // chunk_size
     all_predictions: Dict[str, List[str]] = {}
 
     th_link = clf.best_th_link
     th_sing = clf.best_th_singleton
 
+    # Build target map once for instantaneous O(1) feature lookup across all chunks
+    logger.info("Indexing target records for high-speed candidate feature lookup...")
+    t_idx = time.time()
+    t_ids = target_prep["entity_id"].to_numpy()
+    t_cnames = target_prep["clean_name"].to_numpy()
+    t_caddrs = target_prep["clean_addr"].to_numpy()
+    t_miss = (
+        target_prep["is_addr_missing"].to_numpy()
+        if "is_addr_missing" in target_prep.columns
+        else np.zeros(len(t_ids), dtype=np.int32)
+    )
+    t_rnames = target_prep["raw_name"].to_numpy() if "raw_name" in target_prep.columns else t_cnames
+    t_dstems = target_prep["domain_stem"].to_numpy() if "domain_stem" in target_prep.columns else np.array([""] * len(t_ids))
+
+    target_map = {
+        t_ids[i]: (t_cnames[i], t_caddrs[i], int(t_miss[i]), t_rnames[i], t_dstems[i])
+        for i in range(len(t_ids))
+    }
+    logger.info(f"Target index built in {time.time() - t_idx:.2f}s ({len(target_map):,} target records).")
+    logger.info(
+        f"Starting chunked scoring for {total_entities:,} reference entities "
+        f"across {total_chunks} chunks (chunk_size={chunk_size:,}, th_link={th_link:.2f}, th_sing={th_sing:.2f})..."
+    )
+
     with open(output_matching_path, "w", encoding="utf-8") as f_out:
         f_out.write("source1_entity_id\tmatched_entity_ids\n")
 
-        pbar = tqdm(total=total_entities, desc="Scoring S1 Entities", unit="entities")
-        for chunk_idx in range(0, total_entities, chunk_size):
-            chunk_s1_ids = all_s1_ids[chunk_idx : min(chunk_idx + chunk_size, total_entities)]
-            chunk_cand_dict = {
-                s1_id: candidates_dict.get(s1_id, []) for s1_id in chunk_s1_ids
-            }
+        with tqdm(total=total_entities, desc="Scoring S1 Entities", unit="entities", dynamic_ncols=True) as pbar:
+            for chunk_idx in range(0, total_entities, chunk_size):
+                chunk_num = (chunk_idx // chunk_size) + 1
+                chunk_end = min(chunk_idx + chunk_size, total_entities)
+                chunk_s1_ids = all_s1_ids[chunk_idx:chunk_end]
+                pbar.set_description(f"Scoring [Chunk {chunk_num}/{total_chunks}]")
 
-            # Filter s1_prep for chunk
-            s1_chunk_prep = s1_prep[s1_prep["entity_id"].isin(set(chunk_s1_ids))]
-
-            # Build feature matrix for chunk
-            meta_chunk, feats_chunk = build_candidate_feature_matrix(
-                chunk_cand_dict, s1_chunk_prep, target_prep
-            )
-
-            if len(feats_chunk) > 0:
-                probs = clf.model.predict_proba(feats_chunk)[:, 1]
-                meta_chunk["prob"] = probs
-
-                grouped = meta_chunk.groupby("source1_entity_id")
-                grouped_dict = {
-                    s1_id: (group["target_entity_id"].tolist(), group["prob"].to_numpy())
-                    for s1_id, group in grouped
+                chunk_cand_dict = {
+                    s1_id: candidates_dict.get(s1_id, []) for s1_id in chunk_s1_ids
                 }
-            else:
-                grouped_dict = {}
 
-            # Apply dual thresholds and write rows
-            for s1_id in chunk_s1_ids:
-                if s1_id not in grouped_dict:
-                    all_predictions[s1_id] = []
-                    f_out.write(f"{s1_id}\t\n")
-                    continue
+                # Fast slice of s1_prep for chunk
+                s1_chunk_prep = s1_prep.iloc[chunk_idx:chunk_end]
 
-                target_ids, p_arr = grouped_dict[s1_id]
-                max_p = p_arr.max() if len(p_arr) > 0 else 0.0
+                # Build feature matrix using precomputed target_map
+                meta_chunk, feats_chunk = build_candidate_feature_matrix(
+                    chunk_cand_dict, s1_chunk_prep, target_map=target_map, show_progress=False
+                )
 
-                if max_p < th_sing:
-                    matched = []
+                if len(feats_chunk) > 0:
+                    probs = clf.model.predict_proba(feats_chunk)[:, 1]
+                    meta_chunk["prob"] = probs
+
+                    grouped = meta_chunk.groupby("source1_entity_id")
+                    grouped_dict = {
+                        s1_id: (group["target_entity_id"].tolist(), group["prob"].to_numpy())
+                        for s1_id, group in grouped
+                    }
                 else:
-                    valid_mask = p_arr >= th_link
-                    matched = [target_ids[i] for i, valid in enumerate(valid_mask) if valid]
+                    grouped_dict = {}
 
-                all_predictions[s1_id] = matched
-                match_str = ",".join(matched)
-                f_out.write(f"{s1_id}\t{match_str}\n")
+                # Apply dual thresholds and write rows
+                chunk_matches_count = 0
+                for s1_id in chunk_s1_ids:
+                    if s1_id not in grouped_dict:
+                        all_predictions[s1_id] = []
+                        f_out.write(f"{s1_id}\t\n")
+                        continue
 
-            pbar.update(len(chunk_s1_ids))
+                    target_ids, p_arr = grouped_dict[s1_id]
+                    max_p = p_arr.max() if len(p_arr) > 0 else 0.0
 
-        pbar.close()
+                    if max_p < th_sing:
+                        matched = []
+                    else:
+                        valid_mask = p_arr >= th_link
+                        matched = [target_ids[i] for i, valid in enumerate(valid_mask) if valid]
+
+                    if matched:
+                        chunk_matches_count += 1
+                    all_predictions[s1_id] = matched
+                    match_str = ",".join(matched)
+                    f_out.write(f"{s1_id}\t{match_str}\n")
+
+                pbar.set_postfix(chunk=f"{chunk_num}/{total_chunks}", pairs=f"{len(feats_chunk):,}")
+                pbar.update(len(chunk_s1_ids))
 
     logger.info(f"Chunked scoring and disk export completed: {output_matching_path}")
     return all_predictions
@@ -193,11 +232,13 @@ def execute_full_pipeline(
     s3_path: str,
     candidate_out: str = "output/candidate_pairs.tsv",
     matching_out: str = "output/matching_results.tsv",
-    model_path: str = "models/lgbm_ber_model.joblib",
+    model_path: str = "models/xgb_ber_model.joblib",
     gt_path: Optional[str] = None,
     chunk_size: int = 20000,
-    top_k: int = 35,
-    min_sim: float = 0.12,
+    top_k: int = 20,
+    min_sim: float = 0.10,
+    country_filter: Optional[str] = None,
+    limit: Optional[int] = None,
 ) -> Dict[str, float]:
     """
     Execute complete end-to-end BER pipeline from raw TSVs to final formatted submissions.
@@ -226,12 +267,12 @@ def execute_full_pipeline(
         f"S1={len(df_s1):,}, S2={len(df_s2):,}, S3={len(df_s3):,}"
     )
 
-    # 3. Preprocess representations once
+    # 3. Preprocess representations once with live tqdm progress
     t_prep = time.time()
     logger.info("Preprocessing Source 1, Source 2, and Source 3 text payloads...")
-    s1_prep = preprocess_dataframe(df_s1)
-    s2_prep = preprocess_dataframe(df_s2)
-    s3_prep = preprocess_dataframe(df_s3)
+    s1_prep = preprocess_dataframe(df_s1, desc="Preprocessing S1")
+    s2_prep = preprocess_dataframe(df_s2, desc="Preprocessing S2")
+    s3_prep = preprocess_dataframe(df_s3, desc="Preprocessing S3")
     target_prep = pd.concat([s2_prep, s3_prep], ignore_index=True)
     logger.info(
         f"Preprocessing completed in {time.time() - t_prep:.2f}s: "
@@ -240,16 +281,25 @@ def execute_full_pipeline(
 
     # 4. Candidate Generation (Blocking)
     t_block = time.time()
-    blocker = DynamicTFIDFBlocker(top_k=top_k, min_similarity=min_sim, batch_size=5000)
+    blocker = DynamicTFIDFBlocker(top_k=top_k, min_similarity=min_sim, batch_size=1000)
     
     # Run blocking on preprocessed data directly
     countries = sorted(s1_prep["country"].dropna().unique())
+    if country_filter:
+        countries = [c for c in countries if str(c).lower() == country_filter.lower()]
     logger.info(f"Discovered countries to process: {countries}")
     candidates_dict: Dict[str, List[str]] = {}
 
     for country in countries:
         s1_country = s1_prep[s1_prep["country"] == country].reset_index(drop=True)
         target_country = target_prep[target_prep["country"] == country].reset_index(drop=True)
+        if limit is not None and limit > 0:
+            s1_country = s1_country.iloc[:limit].reset_index(drop=True)
+            logger.info(
+                f"Applying limit: {len(s1_country):,} S1 queries for '{country}' "
+                f"(full target pool: {len(target_country):,})"
+            )
+
         logger.info(f"\n>>> Processing Country Partition: '{country}' (S1: {len(s1_country):,}, Targets: {len(target_country):,})")
         
         cands = blocker.block_country_partition(

@@ -104,8 +104,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--model-path",
-        default="models/lgbm_ber_model.joblib",
-        help="Path for cached/trained LightGBM model.",
+        default="models/xgb_ber_model.joblib",
+        help="Path for cached/trained XGBoost model.",
     )
     parser.add_argument(
         "--chunk-size",
@@ -116,14 +116,25 @@ def main() -> None:
     parser.add_argument(
         "--top-k",
         type=int,
-        default=35,
-        help="Top-K candidates per entity during blocking (default: 35).",
+        default=20,
+        help="Top-K candidates per entity during blocking (default: 20).",
     )
     parser.add_argument(
         "--min-sim",
         type=float,
-        default=0.12,
-        help="Minimum cosine similarity for candidates (default: 0.12).",
+        default=0.10,
+        help="Minimum cosine similarity for candidates (default: 0.10).",
+    )
+    parser.add_argument(
+        "--country",
+        default=None,
+        help="Filter to specific country partition (e.g. France).",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Limit S1 queries per country for fast benchmark/sanity check.",
     )
     args = parser.parse_args()
 
@@ -152,6 +163,8 @@ def main() -> None:
         chunk_size=args.chunk_size,
         top_k=args.top_k,
         min_sim=args.min_sim,
+        country_filter=args.country,
+        limit=args.limit,
     )
 
     # Validate output files

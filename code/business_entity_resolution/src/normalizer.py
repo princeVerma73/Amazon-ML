@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from typing import Optional, Union
+from typing import List, Optional, Union
 import pandas as pd
+from tqdm import tqdm
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +124,70 @@ AMPERSAND_REGEX = re.compile(r"&")
 NON_ALPHANUMERIC_REGEX = re.compile(r"[^a-z0-9\s]")
 WHITESPACE_REGEX = re.compile(r"\s+")
 
+# ---------------------------------------------------------------------------
+# Domain Stem Regex Patterns & Extraction
+# ---------------------------------------------------------------------------
+
+# Domain URL token pattern: matches protocol, www, domain label, and common TLDs
+DOMAIN_TOKEN_REGEX = re.compile(
+    r"(?:https?://)?(?:www\d*\.)?[a-zA-Z0-9][-a-zA-Z0-9.]*\.(?:co\.in|org\.in|com|in|org|fr|net|co|io|biz|info|gov|edu|eu|us)\b(?:/[^\s]*)?",
+    flags=re.IGNORECASE,
+)
+DOMAIN_PROTOCOL_WWW_REGEX = re.compile(
+    r"^(?:https?://)?(?:www\d*\.)?",
+    flags=re.IGNORECASE,
+)
+DOMAIN_TLD_SUFFIX_REGEX = re.compile(
+    r"\.(?:co\.in|org\.in|com|in|org|fr|net|co|io|biz|info|gov|edu|eu|us)$",
+    flags=re.IGNORECASE,
+)
+DOMAIN_INVALID_CHARS_REGEX = re.compile(r"[^a-z0-9-]")
+
+
+def extract_domain_stem(s: Optional[Union[str, float]]) -> str:
+    """
+    Clean and extract domain stems from business names, text payloads, or URLs.
+    
+    Strips protocol ('https://', 'http://'), 'www.' prefixes, paths, and common
+    TLDs (e.g., '.com', '.in', '.org', '.fr', '.co.in', '.net', etc.) using regex
+    to isolate the script- and domain-invariant brand stem.
+    
+    Args:
+        s: Raw input text string or missing value.
+        
+    Returns:
+        Extracted lowercase domain stem, or empty string if no valid domain found.
+    """
+    if s is None or not isinstance(s, str):
+        return ""
+    
+    s_clean = s.strip()
+    tokens = DOMAIN_TOKEN_REGEX.findall(s_clean)
+    if not tokens:
+        return ""
+    
+    candidate = tokens[0]
+    # Strip protocol and www
+    candidate = DOMAIN_PROTOCOL_WWW_REGEX.sub("", candidate)
+    # Strip path / query
+    candidate = candidate.split("/")[0].split("?")[0]
+    # Strip known TLD extension
+    stem = DOMAIN_TLD_SUFFIX_REGEX.sub("", candidate)
+    # If subdomains exist (e.g. shop.brand), select core brand domain stem
+    parts = stem.split(".")
+    domain = parts[-1]
+    
+    cleaned = DOMAIN_INVALID_CHARS_REGEX.sub("", domain.lower()).strip("-")
+    return cleaned
+
+
+def clean_domain_stem(s: Optional[Union[str, float]]) -> str:
+    """
+    Clean and extract domain stem from input text.
+    Alias for extract_domain_stem.
+    """
+    return extract_domain_stem(s)
+
 
 # ---------------------------------------------------------------------------
 # Core Normalization Functions
@@ -215,6 +280,8 @@ def preprocess_dataframe(
     name_col: str = "business_name",
     addr_col: str = "business_address",
     inplace: bool = False,
+    desc: str = "Preprocessing",
+    show_progress: bool = True,
 ) -> pd.DataFrame:
     """
     Preprocess an entity DataFrame with vectorized high-speed string normalization.
@@ -230,6 +297,8 @@ def preprocess_dataframe(
         name_col: Column name containing business names.
         addr_col: Column name containing business addresses.
         inplace: Whether to mutate input DataFrame or return a shallow copy.
+        desc: Description label for tqdm progress bar.
+        show_progress: Whether to show live tqdm progress bar.
         
     Returns:
         Preprocessed DataFrame with cleaned text and indicator columns.
@@ -253,18 +322,47 @@ def preprocess_dataframe(
     else:
         raw_names = [""] * len(target_df)
         
-    # Apply fast list comprehension transforms
-    clean_names = [clean_legal_suffixes(normalize_text(name)) for name in raw_names]
-    clean_addrs = [clean_address(addr) for addr in raw_addrs]
-    
+    total_rows = len(target_df)
+    chunk_size = 100000
+
+    if show_progress and total_rows > chunk_size:
+        clean_names: List[str] = []
+        clean_addrs: List[str] = []
+        domain_stems: List[str] = []
+        has_non_ascii: List[bool] = []
+        clean_joint: List[str] = []
+
+        with tqdm(total=total_rows, desc=desc, unit="records", dynamic_ncols=True) as pbar:
+            for i in range(0, total_rows, chunk_size):
+                end_i = min(i + chunk_size, total_rows)
+                sub_names = raw_names[i:end_i]
+                sub_addrs = raw_addrs[i:end_i]
+
+                c_n = [clean_legal_suffixes(normalize_text(name)) for name in sub_names]
+                c_a = [clean_address(addr) for addr in sub_addrs]
+                d_s = [extract_domain_stem(name) or extract_domain_stem(addr) for name, addr in zip(sub_names, sub_addrs)]
+                h_na = [not (name.isascii() if isinstance(name, str) else True) for name in sub_names]
+                c_j = [f"{n} {n} {a}".strip() if a else f"{n} {n}".strip() for n, a in zip(c_n, c_a)]
+
+                clean_names.extend(c_n)
+                clean_addrs.extend(c_a)
+                domain_stems.extend(d_s)
+                has_non_ascii.extend(h_na)
+                clean_joint.extend(c_j)
+                pbar.update(end_i - i)
+    else:
+        clean_names = [clean_legal_suffixes(normalize_text(name)) for name in raw_names]
+        clean_addrs = [clean_address(addr) for addr in raw_addrs]
+        domain_stems = [extract_domain_stem(name) or extract_domain_stem(addr) for name, addr in zip(raw_names, raw_addrs)]
+        has_non_ascii = [not (name.isascii() if isinstance(name, str) else True) for name in raw_names]
+        clean_joint = [f"{n} {n} {a}".strip() if a else f"{n} {n}".strip() for n, a in zip(clean_names, clean_addrs)]
+
     target_df["clean_name"] = clean_names
     target_df["clean_addr"] = clean_addrs
-    
-    # 3. Create weighted joint text (giving name 2x weighting for blocking recall)
-    target_df["clean_joint"] = [
-        f"{n} {n} {a}".strip() if a else f"{n} {n}".strip()
-        for n, a in zip(clean_names, clean_addrs)
-    ]
+    target_df["raw_name"] = raw_names
+    target_df["domain_stem"] = domain_stems
+    target_df["has_non_ascii"] = has_non_ascii
+    target_df["clean_joint"] = clean_joint
     
     return target_df
 
@@ -294,3 +392,15 @@ def normalize_dataframe(
     if create_joint:
         res["norm_joint"] = res["clean_joint"]
     return res
+
+
+__all__ = [
+    "normalize_text",
+    "clean_legal_suffixes",
+    "clean_address",
+    "extract_domain_stem",
+    "clean_domain_stem",
+    "preprocess_dataframe",
+    "normalize_business_name",
+    "normalize_dataframe",
+]

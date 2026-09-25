@@ -1,9 +1,9 @@
 """
-Phase 3: LightGBM GBDT Classification & Macro F_0.5 Threshold Optimization Module.
+Step 3: XGBoost Classification, Live Progress Logging, and 2D Dual-Threshold Grid Search.
 
-Trains gradient boosted decision tree classifier on SIMD pairwise features,
-performs leak-free group split validation, and executes 2D threshold grid search
-to maximize instance-level Macro F_0.5 score on business entity linkages.
+Trains an XGBoost GBDT classifier on pairwise feature representations, logs live iteration loss,
+auto-checkpoints the optimal model based on validation loss, and executes 2D threshold grid search
+over link thresholds [0.65, 0.85] and singleton floors [0.20, 0.40] to maximize instance-level Macro F0.5.
 """
 
 from __future__ import annotations
@@ -13,12 +13,13 @@ import logging
 import os
 import sys
 import time
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
-import lightgbm as lgb
+import joblib
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
+import xgboost as xgb
 
 try:
     from .feature_extraction import (
@@ -47,7 +48,7 @@ def parse_ground_truth(gt_path: str) -> Dict[str, Set[str]]:
     gt_df = pd.read_csv(gt_path, sep="\t", keep_default_na=False)
     gt_map: Dict[str, Set[str]] = {}
     for _, row in gt_df.iterrows():
-        s1_id = row["source1_entity_id"]
+        s1_id = str(row["source1_entity_id"]).strip()
         raw_m = str(row["matched_entity_ids"]).strip()
         matches = set(m.strip() for m in raw_m.split(",") if m.strip())
         gt_map[s1_id] = matches
@@ -76,12 +77,10 @@ def compute_instance_macro_f05(
         # Case 1: Ground truth is singleton (0 matches)
         if len(true_set) == 0:
             if len(pred_set) == 0:
-                # Correct singleton prediction
                 f05_scores.append(1.0)
                 precisions.append(1.0)
                 recalls.append(1.0)
             else:
-                # False positive link on singleton
                 f05_scores.append(0.0)
                 precisions.append(0.0)
                 recalls.append(1.0)
@@ -118,34 +117,42 @@ def grid_search_thresholds(
     val_probs: np.ndarray,
     val_s1_ids: Sequence[str],
     ground_truth_map: Dict[str, Set[str]],
-) -> Tuple[float, float, float, float, float]:
+    link_range: Optional[np.ndarray] = None,
+    singleton_range: Optional[np.ndarray] = None,
+) -> Tuple[float, float, float, float, float, List[Dict[str, float]]]:
     """
     2D Grid Search over link and singleton thresholds to maximize Macro F_0.5.
     
-    Returns:
-        (best_th_link, best_th_singleton, best_macro_f05, best_prec, best_rec)
+    Iterates over link_threshold in [0.65, 0.85] (step 0.02) and singleton_floor in [0.20, 0.40] (step 0.05).
+    Prints live step progress and returns top candidate threshold combinations.
     """
     val_meta_df = val_meta_df.copy()
     val_meta_df["prob"] = val_probs
 
-    # Group predictions by s1
     s1_grouped = val_meta_df.groupby("source1_entity_id")
     s1_cand_data = {
         s1_id: (group["target_entity_id"].tolist(), group["prob"].to_numpy())
         for s1_id, group in s1_grouped
     }
 
-    th_link_range = np.linspace(0.40, 0.85, 10)
-    th_singleton_range = np.linspace(0.50, 0.90, 9)
+    if link_range is None:
+        link_range = np.arange(0.65, 0.8501, 0.02)
+    if singleton_range is None:
+        singleton_range = np.arange(0.20, 0.4001, 0.05)
 
-    best_f05 = -1.0
-    best_link = 0.50
-    best_sing = 0.50
-    best_p = 0.0
-    best_r = 0.0
+    total_steps = len(link_range) * len(singleton_range)
+    all_results: List[Dict[str, float]] = []
 
-    for th_sing in th_singleton_range:
-        for th_link in th_link_range:
+    print("\n" + "=" * 75)
+    print(f"STARTING 2D DUAL-THRESHOLD GRID SEARCH ({total_steps} COMBINATIONS)")
+    print(f"  Link Threshold Range:      [{link_range[0]:.2f}, {link_range[-1]:.2f}] (step 0.02)")
+    print(f"  Singleton Floor Range:     [{singleton_range[0]:.2f}, {singleton_range[-1]:.2f}] (step 0.05)")
+    print("=" * 75)
+
+    step = 0
+    for th_sing in singleton_range:
+        for th_link in link_range:
+            step += 1
             preds_map: Dict[str, List[str]] = {}
 
             for s1_id in val_s1_ids:
@@ -163,42 +170,85 @@ def grid_search_thresholds(
                     preds_map[s1_id] = [target_ids[i] for i, valid in enumerate(valid_mask) if valid]
 
             f05, p, r = compute_instance_macro_f05(preds_map, ground_truth_map, val_s1_ids)
+            result = {
+                "step": step,
+                "th_link": float(th_link),
+                "th_singleton": float(th_sing),
+                "macro_f05": float(f05),
+                "precision": float(p),
+                "recall": float(r),
+            }
+            all_results.append(result)
 
-            if f05 > best_f05:
-                best_f05 = f05
-                best_link = float(th_link)
-                best_sing = float(th_sing)
-                best_p = p
-                best_r = r
+            print(
+                f"[Step {step:2d}/{total_steps}] link={th_link:.2f}, singleton_floor={th_sing:.2f} "
+                f"-> Macro F0.5 = {f05:.4f} (Prec: {p:.4f}, Rec: {r:.4f})"
+            )
 
-    return best_link, best_sing, best_f05, best_p, best_r
+    all_results.sort(key=lambda x: x["macro_f05"], reverse=True)
+
+    print("\n" + "=" * 75)
+    print("TOP 3 BEST CANDIDATE THRESHOLD COMBINATIONS")
+    print("=" * 75)
+    for rank, res in enumerate(all_results[:3], start=1):
+        status = "[BEST - LOCKED]" if rank == 1 else ""
+        print(
+            f"Rank {rank}: link_threshold={res['th_link']:.2f}, singleton_floor={res['th_singleton']:.2f} "
+            f"-> Macro F0.5 = {res['macro_f05']:.4f} (Prec: {res['precision']:.4f}, Rec: {res['recall']:.4f}) {status}"
+        )
+    print("=" * 75 + "\n")
+
+    best = all_results[0]
+    return (
+        best["th_link"],
+        best["th_singleton"],
+        best["macro_f05"],
+        best["precision"],
+        best["recall"],
+        all_results[:3],
+    )
 
 
 class BERClassifier:
     """
-    End-to-end LightGBM GBDT pairwise classification and inference model.
+    Pairwise classification and inference engine utilizing XGBoost GBDT
+    with automatic model checkpointing and 2D threshold optimization.
     """
+
+    __module__ = "classifier"
 
     def __init__(
         self,
-        learning_rate: float = 0.08,
-        num_leaves: int = 31,
-        n_estimators: int = 300,
+        n_estimators: int = 800,
+        learning_rate: float = 0.04,
+        max_depth: int = 6,
+        subsample: float = 0.85,
+        colsample_bytree: float = 0.85,
+        tree_method: str = "hist",
+        scale_pos_weight: float = 0.6,
+        eval_metric: str = "logloss",
         random_state: int = 42,
+        n_jobs: int = -1,
+        early_stopping_rounds: int = 40,
     ) -> None:
-        self.model = lgb.LGBMClassifier(
-            objective="binary",
-            metric="auc",
-            learning_rate=learning_rate,
-            num_leaves=num_leaves,
+        self.model = xgb.XGBClassifier(
             n_estimators=n_estimators,
+            learning_rate=learning_rate,
+            max_depth=max_depth,
+            subsample=subsample,
+            colsample_bytree=colsample_bytree,
+            tree_method=tree_method,
+            scale_pos_weight=scale_pos_weight,
+            eval_metric=eval_metric,
             random_state=random_state,
-            n_jobs=-1,
-            importance_type="gain",
-            verbose=-1,
+            n_jobs=n_jobs,
+            early_stopping_rounds=early_stopping_rounds,
         )
-        self.best_th_link = 0.55
-        self.best_th_singleton = 0.65
+        self.best_th_link = 0.75
+        self.best_th_singleton = 0.30
+        self.best_iteration_: Optional[int] = None
+        self.best_score_: Optional[float] = None
+        self.training_duration_seconds_: float = 0.0
 
     def train_and_evaluate(
         self,
@@ -206,12 +256,14 @@ class BERClassifier:
         features_df: pd.DataFrame,
         ground_truth_map: Dict[str, Set[str]],
         test_size: float = 0.20,
-    ) -> Dict[str, float]:
+        checkpoint_path: str = "models/xgb_ber_model.joblib",
+    ) -> Dict[str, Any]:
         """
-        Execute leak-free grouped split training and threshold tuning.
+        Execute leak-free grouped split training with live XGBoost logging,
+        auto-checkpointing the best model, and 2D threshold optimization.
         """
+        train_start = time.time()
         logger.info("Constructing binary labels for candidate pairs...")
-        # Label 1 if target_id in ground_truth_map[s1_id] else 0
         labels = [
             1 if target_id in ground_truth_map.get(s1_id, set()) else 0
             for s1_id, target_id in zip(meta_df["source1_entity_id"], meta_df["target_entity_id"])
@@ -219,9 +271,12 @@ class BERClassifier:
         y = np.array(labels, dtype=np.int32)
         n_pos = int(y.sum())
         n_neg = len(y) - n_pos
-        logger.info(f"Feature dataset: {len(y):,} pairs ({n_pos:,} Positives, {n_neg:,} Negatives | Positive Ratio: {n_pos/len(y)*100:.2f}%)")
+        logger.info(
+            f"Feature dataset: {len(y):,} pairs ({n_pos:,} Positives, {n_neg:,} Negatives | "
+            f"Positive Ratio: {n_pos/len(y)*100:.2f}%)"
+        )
 
-        # Grouped split on source1_entity_id
+        # Leak-free grouped split strictly on source1_entity_id
         unique_s1 = np.array(sorted(meta_df["source1_entity_id"].unique()))
         train_s1, val_s1 = train_test_split(unique_s1, test_size=test_size, random_state=42)
         train_s1_set = set(train_s1)
@@ -234,63 +289,69 @@ class BERClassifier:
         X_val, y_val = features_df[val_mask], y[val_mask]
         val_meta = meta_df[val_mask].reset_index(drop=True)
 
-        logger.info(f"Grouped Split: {len(train_s1):,} Train S1 ({len(X_train):,} pairs), {len(val_s1):,} Val S1 ({len(X_val):,} pairs)")
+        logger.info(
+            f"Grouped Split: {len(train_s1):,} Train S1 ({len(X_train):,} pairs), "
+            f"{len(val_s1):,} Val S1 ({len(X_val):,} pairs)"
+        )
 
-        logger.info("Training LightGBM Classifier with early stopping...")
+        logger.info("\nStarting XGBClassifier training with live iteration loss logging (verbose=50)...")
         self.model.fit(
             X_train,
             y_train,
-            eval_set=[(X_val, y_val)],
-            callbacks=[lgb.early_stopping(stopping_rounds=30, verbose=False)],
+            eval_set=[(X_train, y_train), (X_val, y_val)],
+            verbose=50,
         )
 
+        self.training_duration_seconds_ = time.time() - train_start
+        self.best_iteration_ = getattr(self.model, "best_iteration", self.model.n_estimators)
+        self.best_score_ = getattr(self.model, "best_score", 0.0)
+
+        logger.info(
+            f"\nXGBoost training finished in {self.training_duration_seconds_:.2f}s! "
+            f"Optimal Iteration: {self.best_iteration_}, Best Validation Loss: {self.best_score_:.5f}"
+        )
+
+        # Auto-checkpoint model
+        os.makedirs(os.path.dirname(os.path.abspath(checkpoint_path)), exist_ok=True)
+        joblib.dump(self, checkpoint_path)
+        logger.info(f"Auto-checkpointed best model based on validation loss to: {checkpoint_path}")
+
+        # Compute validation probabilities using the best iteration
         val_probs = self.model.predict_proba(X_val)[:, 1]
 
-        # Default 0.5 Cutoff Metric
-        default_preds: Dict[str, List[str]] = {}
-        val_meta_prob = val_meta.copy()
-        val_meta_prob["prob"] = val_probs
-        for s1_id, group in val_meta_prob.groupby("source1_entity_id"):
-            valid = group[group["prob"] >= 0.50]["target_entity_id"].tolist()
-            default_preds[s1_id] = valid
-        def_f05, def_p, def_r = compute_instance_macro_f05(default_preds, ground_truth_map, val_s1)
-        logger.info(f"Baseline (Threshold=0.50): Macro F_0.5 = {def_f05:.4f} (Prec: {def_p:.4f}, Rec: {def_r:.4f})")
-
-        # 2D Grid Search
-        logger.info("Executing 2D Threshold Optimization Grid Search for Macro F_0.5...")
-        best_link, best_sing, opt_f05, opt_p, opt_r = grid_search_thresholds(
+        # 2D Grid Search over link_threshold [0.65, 0.85] and singleton_floor [0.20, 0.40]
+        best_link, best_sing, opt_f05, opt_p, opt_r, top_3 = grid_search_thresholds(
             val_meta, val_probs, val_s1, ground_truth_map
         )
         self.best_th_link = best_link
         self.best_th_singleton = best_sing
 
-        # Feature importances
-        importances = self.model.feature_importances_
-        imp_df = pd.DataFrame({"feature": FEATURE_COLUMNS, "importance": importances}).sort_values(
-            by="importance", ascending=False
-        )
-        top_features_str = ", ".join([f"{r['feature']} ({r['importance']:.1f})" for _, r in imp_df.head(5).iterrows()])
-        logger.info(f"Top 5 Features by Gain: {top_features_str}")
+        # Re-save checkpoint with locked optimal thresholds
+        joblib.dump(self, checkpoint_path)
+        logger.info(f"Updated checkpoint with locked optimal thresholds: {checkpoint_path}")
 
-        print("\n" + "=" * 70)
-        print("PHASE 3 CLASSIFICATION & THRESHOLD TUNING REPORT")
-        print("=" * 70)
-        print(f"Validation S1 Entities:           {len(val_s1):,}")
-        print(f"Default Cutoff (0.50):            Macro F_0.5 = {def_f05:.4f} (Prec: {def_p:.4f}, Rec: {def_r:.4f})")
-        print(f"Optimal Threshold Link:           {best_link:.3f}")
-        print(f"Optimal Threshold Singleton:      {best_sing:.3f}")
-        print(f"Optimized Macro F_0.5 Score:      {opt_f05:.4f} (+{(opt_f05 - def_f05):.4f} gain)")
-        print(f"Optimized Precision:              {opt_p:.4f}")
-        print(f"Optimized Recall:                 {opt_r:.4f}")
-        print("=" * 70 + "\n")
+        # Feature importances
+        try:
+            importances = self.model.feature_importances_
+            imp_df = pd.DataFrame({"feature": FEATURE_COLUMNS, "importance": importances}).sort_values(
+                by="importance", ascending=False
+            )
+            top_features_str = ", ".join([f"{r['feature']} ({r['importance']:.3f})" for _, r in imp_df.head(5).iterrows()])
+            logger.info(f"Top 5 Features by Gain: {top_features_str}")
+        except Exception:
+            pass
 
         return {
-            "default_macro_f05": def_f05,
+            "training_duration_seconds": self.training_duration_seconds_,
+            "optimal_iteration": self.best_iteration_,
+            "best_validation_logloss": self.best_score_,
+            "best_th_link": self.best_th_link,
+            "best_th_singleton": self.best_th_singleton,
             "optimized_macro_f05": opt_f05,
             "optimized_precision": opt_p,
             "optimized_recall": opt_r,
-            "best_th_link": best_link,
-            "best_th_singleton": best_sing,
+            "top_3_candidates": top_3,
+            "checkpoint_path": checkpoint_path,
         }
 
     def predict_matches(
@@ -328,20 +389,20 @@ class BERClassifier:
         return preds_map
 
 
-def export_matching_results(predictions_map: Dict[str, List[str]], all_s1_ids: Sequence[str], output_path: str) -> None:
-    """
-    Export final matching_results.tsv strictly conforming to the competition specification.
-    Header: source1_entity_id\tmatched_entity_ids
-    """
+def export_matching_results(
+    predictions_map: Dict[str, List[str]],
+    all_s1_ids: Sequence[str],
+    output_path: str = "output/matching_results.tsv",
+) -> None:
+    """Export predictions TSV satisfying strict competition schema."""
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-    logger.info(f"Writing {len(all_s1_ids):,} matching rows to {output_path}...")
     with open(output_path, "w", encoding="utf-8") as f:
         f.write("source1_entity_id\tmatched_entity_ids\n")
         for s1_id in all_s1_ids:
-            matches = predictions_map.get(s1_id, [])
-            match_str = ",".join(matches)
+            matched_list = predictions_map.get(s1_id, [])
+            match_str = ",".join(matched_list)
             f.write(f"{s1_id}\t{match_str}\n")
-    logger.info(f"Export completed: {output_path}")
+    logger.info(f"Exported {len(all_s1_ids):,} predictions to: {output_path}")
 
 
 def run_phase3_pipeline(
@@ -349,62 +410,87 @@ def run_phase3_pipeline(
     s2_path: str = "sample_data/sample_source2.tsv",
     s3_path: str = "sample_data/sample_source3.tsv",
     gt_path: str = "sample_data/sample_ground_truth.tsv",
-    candidate_tsv_path: str = "output/candidate_pairs.tsv",
+    candidate_tsv_path: Optional[str] = None,
     output_matching_path: str = "output/matching_results.tsv",
-) -> Dict[str, float]:
+    checkpoint_path: str = "models/xgb_ber_model.joblib",
+) -> Dict[str, Any]:
     """
-    Execute complete Phase 3 pipeline on candidate pairs.
+    Execute complete Step 3 training and threshold optimization on sample dataset.
     """
     t0 = time.time()
-    logger.info("Loading preprocessed source data for feature computation...")
+    logger.info("=" * 75)
+    logger.info("STEP 3: CLASSIFIER TRAINING & 2D DUAL-THRESHOLD OPTIMIZATION")
+    logger.info("=" * 75)
+
+    # 1. Load source data
+    logger.info("Loading preprocessed source data...")
     df_s1 = pd.read_csv(s1_path, sep="\t", keep_default_na=False)
     df_s2 = pd.read_csv(s2_path, sep="\t", keep_default_na=False)
     df_s3 = pd.read_csv(s3_path, sep="\t", keep_default_na=False)
-    
+
     s1_prep = preprocess_dataframe(df_s1)
     s2_prep = preprocess_dataframe(df_s2)
     s3_prep = preprocess_dataframe(df_s3)
     target_prep = pd.concat([s2_prep, s3_prep], ignore_index=True)
 
-    # Read candidate pairs
-    logger.info(f"Reading candidate pairs from {candidate_tsv_path}...")
-    cand_df = pd.read_csv(candidate_tsv_path, sep="\t", keep_default_na=False)
-    cand_dict: Dict[str, List[str]] = {}
-    for _, row in cand_df.iterrows():
-        s1_id = row["source1_entity_id"]
-        cands = [c.strip() for c in str(row["candidate_entity_ids"]).split(",") if c.strip()]
-        cand_dict[s1_id] = cands
+    # 2. Candidate pairs mapping
+    if candidate_tsv_path is None or not os.path.isfile(candidate_tsv_path):
+        if os.path.isfile("sample_data/sample_candidate_pairs.tsv"):
+            candidate_tsv_path = "sample_data/sample_candidate_pairs.tsv"
+        elif os.path.isfile("output/candidate_pairs.tsv"):
+            candidate_tsv_path = "output/candidate_pairs.tsv"
 
-    # Extract features
-    logger.info(f"Extracting SIMD features for {len(cand_dict):,} S1 candidates...")
+    if candidate_tsv_path and os.path.isfile(candidate_tsv_path):
+        logger.info(f"Reading candidate pairs from {candidate_tsv_path}...")
+        cand_df = pd.read_csv(candidate_tsv_path, sep="\t", keep_default_na=False)
+        cand_dict: Dict[str, List[str]] = {}
+        for _, row in cand_df.iterrows():
+            s1_id = row["source1_entity_id"]
+            cands = [c.strip() for c in str(row["candidate_entity_ids"]).split(",") if c.strip()]
+            cand_dict[s1_id] = cands
+    else:
+        logger.info("Candidate TSV not found. Generating candidates via blocker...")
+        from blocking import DynamicTFIDFBlocker
+        blocker = DynamicTFIDFBlocker(top_k=20, min_similarity=0.10)
+        cand_dict = blocker.generate_candidates(df_s1, df_s2, df_s3)
+
+    # 3. Extract features with live progress bar
+    logger.info(f"Extracting SIMD features for {len(cand_dict):,} S1 queries with live progress...")
     t_feat = time.time()
     meta_df, features_df = build_candidate_feature_matrix(cand_dict, s1_prep, target_prep)
     logger.info(f"Extracted {len(features_df):,} pairwise feature vectors in {time.time() - t_feat:.2f}s")
 
-    # Parse Ground Truth
+    # 4. Parse Ground Truth
     gt_map = parse_ground_truth(gt_path)
 
-    # Train and Optimize
+    # 5. Train XGBoost and Optimize 2D Thresholds
     clf = BERClassifier()
-    metrics = clf.train_and_evaluate(meta_df, features_df, gt_map, test_size=0.20)
+    metrics = clf.train_and_evaluate(
+        meta_df=meta_df,
+        features_df=features_df,
+        ground_truth_map=gt_map,
+        test_size=0.20,
+        checkpoint_path=checkpoint_path,
+    )
 
-    # Predict full dataset
+    # 6. Predict full dataset
     all_s1_ids = df_s1["entity_id"].tolist()
     final_preds = clf.predict_matches(meta_df, features_df, all_s1_ids)
     export_matching_results(final_preds, all_s1_ids, output_matching_path)
 
-    logger.info(f"Total Phase 3 execution time: {time.time() - t0:.2f}s")
+    logger.info(f"Total Step 3 execution time: {time.time() - t0:.2f}s")
     return metrics
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Phase 3 Classifier & Threshold Optimization Engine")
+    parser = argparse.ArgumentParser(description="Step 3 XGBoost Classifier & 2D Threshold Tuning Engine")
     parser.add_argument("--s1", default="sample_data/sample_source1.tsv")
     parser.add_argument("--s2", default="sample_data/sample_source2.tsv")
     parser.add_argument("--s3", default="sample_data/sample_source3.tsv")
     parser.add_argument("--gt", default="sample_data/sample_ground_truth.tsv")
-    parser.add_argument("--candidates", default="output/candidate_pairs.tsv")
+    parser.add_argument("--candidates", default="sample_data/sample_candidate_pairs.tsv")
     parser.add_argument("--out", default="output/matching_results.tsv")
+    parser.add_argument("--checkpoint", default="models/xgb_ber_model.joblib")
     args = parser.parse_args()
 
     run_phase3_pipeline(
@@ -414,6 +500,7 @@ def main() -> None:
         gt_path=args.gt,
         candidate_tsv_path=args.candidates,
         output_matching_path=args.out,
+        checkpoint_path=args.checkpoint,
     )
 
 

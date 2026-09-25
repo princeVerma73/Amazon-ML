@@ -12,6 +12,9 @@
 | **Phase 3** | Pairwise Feature Engineering & Classification | ✅ **[COMPLETED]** | Macro F_0.5 = 0.9704; θ_link=0.750, θ_sing=0.500 |
 | **Phase 4** | End-to-End Pipeline Orchestrator (`run_pipeline.py`) | ✅ **[COMPLETED]** | Sample dry-run: 107.81s; F_0.5=0.9703; Validator PASS |
 | **Phase 5** | Full Test Inference & Submission Verification | 🔄 **[IN PROGRESS]** | Running on 11.7M test records → `output/matching_results.tsv` |
+| **Person C - Step 1** | Script, Domain & Numeric Invariant Features | ✅ **[COMPLETED]** | `numeric_pincode_match`, `domain_match`, `script_mismatch`, NFKD preserved |
+| **Person C - Step 2** | 50k Hard-Negative Sample Generation & Calibrated Blocking | ✅ **[COMPLETED]** | 50k S1, Top-K=20, Floor=0.10, 86k hard negs, 714k pairs (3.14:1 ratio) |
+| **Person C - Step 3** | XGBoost Training & 2D Dual-Threshold Grid Search | ✅ **[COMPLETED]** | XGBoost (hist), iter=762, Val Loss=0.01363, Macro F0.5=0.9897 (θ_link=0.83, θ_sing=0.20) |
 
 ---
 
@@ -266,6 +269,102 @@ Phase 3 Benchmark Verification on 25k Holdout Slice (sample_data/):
 
 ---
 
+### Person C Track: Script-Invariant Features & Hard-Negative Calibration
+
+#### Step 1: Language, Domain, and Script-Invariant Features `[COMPLETED]`
+
+To ensure high-recall resolution across heterogeneous multilingual and multi-jurisdictional datasets without violating latency constraints or relying on external APIs, Person C implemented self-contained, script-invariant feature extractors:
+
+1. **`numeric_pincode_match` (Premise & Postal Code Overlap)**:
+   - Robust extraction of 5-6 digit postal codes (US ZIP codes, Indian PIN codes, French postal codes) alongside compound plot, door, flat, unit, and building tokens (e.g. `Plot No. 14`, `H.No 162`, `4-61/28`, `B-6`, `3309`).
+   - Returns a binary match flag (`1.0` if any overlap exists between reference and candidate premises/postal codes, `0.0` otherwise).
+   - Prevents false-positive linkages between businesses with similar names located at different address premises.
+
+2. **`domain_match` (Regex Domain Stem Extraction & Alias Bridge)**:
+   - Precompiled high-throughput regex engine (`DOMAIN_TOKEN_REGEX`, `DOMAIN_PROTOCOL_WWW_REGEX`, `DOMAIN_TLD_SUFFIX_REGEX`) stripping protocol headers (`https://`, `http://`), `www.` subdomains, URL paths, and common TLD extensions (`.com`, `.in`, `.org`, `.fr`, `.co.in`, `.net`, etc.).
+   - Directly bridges brand aliases where one source lists a website (e.g., `helainasorrellclean.com` or `www.trustedin.com`) and another lists the brand name (`Helaina Sorrell Clean` or `Trustedin`).
+   - Returns `1.0` if extracted domain stems match (or if brand-to-domain match is identified), else `0.0`.
+
+3. **`script_mismatch` (Indic vs. ASCII Script Mismatch Indicator)**:
+   - Detects whether one entity record contains non-ASCII characters (e.g., Hindi/Devanagari `सिटी फाउंडेशन`, Telugu `ఇండో టెక్నాలజీ`, or other Indic scripts) while the candidate record is pure ASCII.
+   - Provides a critical binary discriminative signal (`1.0` if script mismatch exists, `0.0` otherwise) to prevent GBDT false alarms on character-level string distance drops caused by script differences.
+
+4. **Preserved NFKD Diacritic Normalization**:
+   - Preserves Unicode NFKD decomposition and combining diacritic stripping (`é` -> `e`, `ç` -> `c`, `à` -> `a`) for French test records.
+
+5. **Design Rationale & Performance**:
+   - **100% Self-Contained**: Implemented entirely with compiled regexes and vectorized NumPy operations.
+   - **Zero API Dependency**: Eliminates external translation API lookups, avoiding rate limits, credential dependencies, and network latency bottlenecks (>100k records/sec).
+
+#### Step 2: 50k Hard-Negative Sample Generation with Calibrated Blocking `[COMPLETED]`
+- **Reference Scale:** 50,000 reference entities sampled from `train_source1.tsv` (stratified: 30,000 US, 20,000 India).
+- **Ground Truth Integrity:** Pulled 100% of true positive matches across S2 and S3 for all 50k reference entities from `train_ground_truth.tsv` (172,717 total positive targets; 2,820 singletons = 5.64%).
+- **Blocking Safeguards:** Top-K = 20 with dynamic TF-IDF cosine similarity floor $\ge 0.10$ to eliminate low-score noise while safeguarding recall ceiling.
+- **Hard-Negative Mining:** Mined candidate pairs with TF-IDF cosine similarity between 0.35 and 0.65 that are NOT true matches, maintaining an approximate 3:1 to 4:1 negative-to-positive ratio to harden the classifier against challenging near-miss distractors.
+
+```
+Step 2 Empirical Generation & Calibration Results (sample_data/):
+- Total Reference S1 Entities:          50,000 (30,000 US, 20,000 India)
+- True Ground Truth Singletons:         2,820 (5.64%)
+- True Positive Target Matches:         172,717 (83,718 in S2, 88,999 in S3)
+- Unique Hard Negatives Mined:          86,337
+- Total Candidate Pairs Generated:      714,289
+- Average Candidates per S1 Query:      14.29 (capped at Top-K = 20)
+- Negative-to-Positive Ratio:           3.14 : 1 (target: 3:1 to 4:1)
+- Generated sample_source1.tsv:         50,000 rows
+- Generated sample_ground_truth.tsv:    50,000 rows
+- Generated sample_source2.tsv:         100,368 rows (83,718 true pos + 16,650 hard negs)
+- Generated sample_source3.tsv:         96,346 rows (88,999 true pos + 7,347 hard negs)
+- Generated sample_candidate_pairs.tsv: 50,000 rows (714,289 total pairs)
+- Format & Schema Validation:           PASS (100% compliant)
+```
+
+#### Step 3: XGBoost Training & 2D Dual-Threshold Grid Search `[COMPLETED]`
+
+To achieve high-precision entity linkage and optimal calibration under severe class imbalance, Person C implemented scalable XGBoost training with streaming loss tracking and 2D dual-threshold grid search:
+
+1. **Model Architecture & Hyperparameters**:
+   - `xgb.XGBClassifier` with `tree_method='hist'` for SIMD/histogram-accelerated split building.
+   - `n_estimators=800`, `learning_rate=0.04`, `max_depth=6`, `subsample=0.85`, `colsample_bytree=0.85`.
+   - `scale_pos_weight=0.6` (penalizing false positive merges in line with Macro $F_{0.5}$ precision emphasis), `eval_metric='logloss'`, `random_state=42`, `n_jobs=-1`.
+   - `early_stopping_rounds=40` with dual validation tracking `eval_set=[(X_train, y_train), (X_val, y_val)]` and `verbose=50` streaming directly to the terminal.
+
+2. **Automated Best-Model Checkpointing**:
+   - Automatic model checkpoint serialization directly to `models/xgb_ber_model.joblib`.
+   - Explicit `__module__ = "classifier"` handling guaranteeing portable joblib unpickling across all entrypoints.
+
+3. **2D Dual-Threshold Grid Search**:
+   - Evaluated 55 parameter combinations over:
+     * `link_threshold` $\in [0.65, 0.85]$ (step $0.02$)
+     * `singleton_floor` $\in [0.20, 0.40]$ (step $0.05$)
+   - Instance-level exact Macro $F_{0.5}$ metric computation per S1 reference entity.
+   - Top 3 candidate combinations identified:
+     * **Rank 1 (Locked)**: `link_threshold = 0.83`, `singleton_floor = 0.20` $\rightarrow$ **Macro $F_{0.5} = 0.9897$** (Precision: $0.9944$, Recall: $0.9804$)
+     * **Rank 2**: `link_threshold = 0.83`, `singleton_floor = 0.25` $\rightarrow$ **Macro $F_{0.5} = 0.9897$** (Precision: $0.9944$, Recall: $0.9804$)
+     * **Rank 3**: `link_threshold = 0.83`, `singleton_floor = 0.30` $\rightarrow$ **Macro $F_{0.5} = 0.9897$** (Precision: $0.9944$, Recall: $0.9804$)
+   - Optimal thresholds permanently locked into `models/xgb_ber_model.joblib`.
+
+```
+Step 3 Empirical Training & Validation Results (sample_data/ 50k reference slice):
+- Total Candidate Pairs Processed:      714,289 (571,431 train, 142,858 val)
+- Total Feature Matrix Generation Time: 57.06s (tqdm streaming @ ~12,500 pairs/sec)
+- XGBoost Training Duration:             23.63s
+- Total Step 3 Runtime:                  122.83s
+- Optimal Iteration:                     762 / 800
+- Validation Logloss at Best Iteration:  0.01363 (Train Logloss: 0.00940)
+- Optimal Locked Thresholds:             link_threshold = 0.83, singleton_floor = 0.20
+- Validation Macro F_0.5 Score:          0.9897
+- Validation Macro Precision:            0.9944
+- Validation Macro Recall:               0.9804
+- Top Feature Importances (Gain):        addr_token_sort_ratio (0.433), numeric_token_overlap (0.209),
+                                         blocking_rank (0.122), addr_token_set_ratio (0.075),
+                                         name_jaro_winkler (0.046), domain_match (0.008)
+- Model Artifact Checkpoint:             models/xgb_ber_model.joblib (2.7 MB, verified)
+- Matching Results Generated:            output/matching_results.tsv (50,000 entities)
+```
+
+---
+
 ### Phase 4: End-to-End Test Pipeline Orchestrator & Submission Generator `[COMPLETED]`
 
 #### 1. Architecture & Execution Strategy
@@ -326,19 +425,69 @@ python run_pipeline.py --mode test `
 | No duplicates | No duplicate `source1_entity_id` rows | `validate_submission.py` |
 | Encoding | UTF-8 (no BOM, no cp1252/Latin-1) | `validate_submission.py` |
 
-#### 4. Test Set Inference Results
-*(To be populated automatically upon `run_pipeline.py --mode test` completion)*
+#### 4. Actual Measured Stage Timings (Run 2 — Fixed)
 
 ```
-Phase 5 Full Test Set Inference Results:
-- Test S1 Entities Processed:          [PENDING -- run in progress]
-- Country Partitions Processed:        France, India, US
-- Total Candidate Pairs Generated:     [PENDING]
-- Candidate Export:                    output/candidate_pairs.tsv
-- Matching Results Export:             output/matching_results.tsv
-- Official Validator Check:            [PENDING]
-- End-to-End Runtime:                  [PENDING]
+Phase 5 Full Test Set Actual Measured Results:
+Run 1 aborted at France blocking due to OOM (see §4.5 below).
+Run 2 (fixed blocking.py) launched at 11:31:42 IST.
+
+  Stage                               Measured / Status
+  ─────────────────────────────────────────────────────────────────────
+  Model Load (joblib)                 immediate   th_link=0.750 θ_sing=0.500
+  Dataset Loading (11.7M rows)        56.41s      S1=1,732,544 S2=4,887,273 S3=5,082,316
+  Text Preprocessing (all sources)    1,591.41s   Combined Target=9,969,589
+  Countries Discovered                instant     ['France', 'India', 'US']
+  TF-IDF Fit — France (1.43M tgts)   185.88s     vocab shape (1434993, 125051)
+  Blocking — France                   [IN PROGRESS — Run 2]
+  Blocking — India                    [PENDING]
+  Blocking — US                       [PENDING]
+  Candidate Export                    [PENDING]
+  Chunked SIMD Scoring                [PENDING]
+  Official Validator                  [PENDING]
+  Total End-to-End Runtime            [PENDING]
 ```
+
+#### 5. OOM Crash — Root Cause & Fix Applied to `blocking.py`
+
+**Crash (Run 1 — 11:18:18 IST):**
+```
+numpy.core._exceptions._ArrayMemoryError:
+  Unable to allocate 52.4 GiB for an array with shape (7,037,741,444,) and dtype int64
+  at: sim_matrix = query_matrix.dot(target_matrix_t).tocsr()
+```
+
+**Root Cause:** `query_matrix.dot(target_matrix_t).tocsr()` — the sparse-sparse dot product
+of `(5000 queries × 125k vocab)` @ `(125k vocab × 1.43M France targets)` produces a
+**nearly dense result** (char n-grams overlap with almost every target). Scipy's CSR
+allocation requires an `indices` array with NNZ=7 billion int64 entries = 52.4 GB.
+This is a fundamental limitation of the sparse intermediate path for large dense-looking results.
+
+**Fix Applied (blocking.py lines 96–165):** Replaced sparse dot product with an
+**adaptive dense matmul path** that bypasses sparse index allocation entirely:
+
+```python
+# Adaptive batch size: keeps dense sim result under 2 GB RAM
+RAM_BUDGET_BYTES = 2 * 1024 ** 3  # 2 GB
+bytes_per_query  = n_targets * 4   # float32 = 4 bytes per score
+effective_batch  = max(1, min(self.batch_size, int(RAM_BUDGET_BYTES / bytes_per_query)))
+
+# Dense matmul via BLAS — scipy dispatches to BLAS when right operand is dense,
+# returning a plain ndarray with NO sparse index allocation.
+query_arr  = vectorizer.transform(batch_texts).toarray()   # (batch, vocab) dense
+sim_dense  = target_matrix.dot(query_arr.T).T              # (batch, n_targets) dense
+```
+
+**Adaptive effective batch sizes for each country partition:**
+
+| Country | n_targets | effective_batch | Peak Dense RAM |
+| :--- | :--- | :--- | :--- |
+| France | 1,434,993 | 374 | ~2.0 GB |
+| India | 4,717,565 | 113 | ~2.0 GB |
+| US | 3,817,031 | 140 | ~2.0 GB |
+
+Fix validated by import check and adaptive batch math. Pipeline relaunched at **11:31:42 IST**.
+Results and validator output will be appended here upon completion.
 
 ---
 
