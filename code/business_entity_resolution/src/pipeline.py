@@ -24,6 +24,7 @@ try:
     from .blocking import DynamicTFIDFBlocker, evaluate_candidate_recall, export_candidate_pairs
     from .classifier import (
         BERClassifier,
+        CatBoostBERClassifier,
         compute_instance_macro_f05,
         export_matching_results,
         parse_ground_truth,
@@ -34,6 +35,7 @@ except (ImportError, ValueError):
     from blocking import DynamicTFIDFBlocker, evaluate_candidate_recall, export_candidate_pairs
     from classifier import (
         BERClassifier,
+        CatBoostBERClassifier,
         compute_instance_macro_f05,
         export_matching_results,
         parse_ground_truth,
@@ -52,12 +54,17 @@ logger = logging.getLogger(__name__)
 
 def train_and_cache_model(
     sample_dir: str = "sample_data",
-    model_save_path: str = "models/xgb_ber_model.joblib",
-) -> BERClassifier:
+    model_save_path: Optional[str] = None,
+    model_type: str = "catboost",
+    force_retrain: bool = False,
+) -> Any:
     """
-    Train and serialize the production XGBoost classifier on the benchmark sample dataset.
+    Train and serialize the production classifier (CatBoost GPU or XGBoost) on benchmark data.
     """
-    if os.path.isfile(model_save_path):
+    if model_save_path is None:
+        model_save_path = "models/catboost_ber_model.joblib" if model_type == "catboost" else "models/xgb_ber_model.joblib"
+
+    if os.path.isfile(model_save_path) and not force_retrain:
         logger.info(f"Checking cached trained model from {model_save_path}...")
         try:
             clf = joblib.load(model_save_path)
@@ -69,7 +76,7 @@ def train_and_cache_model(
         except Exception as e:
             logger.warning(f"Failed to load cached model ({e}). Retraining...")
 
-    logger.info(f"Training production model using benchmark data in '{sample_dir}'...")
+    logger.info(f"Training production {model_type.upper()} model using benchmark data in '{sample_dir}'...")
     os.makedirs(os.path.dirname(os.path.abspath(model_save_path)), exist_ok=True)
 
     s1_path = os.path.join(sample_dir, "sample_source1.tsv")
@@ -85,8 +92,8 @@ def train_and_cache_model(
     if os.path.isfile(cand_tsv):
         cand_df = pd.read_csv(cand_tsv, sep="\t", keep_default_na=False)
         cand_dict = {
-            row["source1_entity_id"]: [c.strip() for c in str(row["candidate_entity_ids"]).split(",") if c.strip()]
-            for _, row in cand_df.iterrows()
+            s1: [c.strip() for c in str(cands).split(",") if c.strip()]
+            for s1, cands in zip(cand_df["source1_entity_id"], cand_df["candidate_entity_ids"])
         }
     else:
         blocker = DynamicTFIDFBlocker(top_k=20, min_similarity=0.10, batch_size=5000)
@@ -102,7 +109,11 @@ def train_and_cache_model(
     gt_map = parse_ground_truth(gt_path)
 
     # 3. Train classifier
-    clf = BERClassifier()
+    if model_type.lower() == "catboost":
+        clf = CatBoostBERClassifier(task_type="GPU")
+    else:
+        clf = BERClassifier()
+
     clf.train_and_evaluate(meta_df, feats_df, gt_map, test_size=0.20, checkpoint_path=model_save_path)
     return clf
 
@@ -232,29 +243,37 @@ def execute_full_pipeline(
     s3_path: str,
     candidate_out: str = "output/candidate_pairs.tsv",
     matching_out: str = "output/matching_results.tsv",
-    model_path: str = "models/xgb_ber_model.joblib",
+    model_path: Optional[str] = None,
+    model_type: str = "catboost",
     gt_path: Optional[str] = None,
     chunk_size: int = 20000,
     top_k: int = 20,
     min_sim: float = 0.10,
     country_filter: Optional[str] = None,
     limit: Optional[int] = None,
+    force_retrain: bool = False,
 ) -> Dict[str, float]:
     """
     Execute complete end-to-end BER pipeline from raw TSVs to final formatted submissions.
     """
     total_start = time.time()
     logger.info("=" * 75)
-    logger.info(f"STARTING BUSINESS ENTITY RESOLUTION END-TO-END PIPELINE")
+    logger.info(f"STARTING BUSINESS ENTITY RESOLUTION END-TO-END PIPELINE ({model_type.upper()})")
     logger.info(f"  Source 1:   {s1_path}")
     logger.info(f"  Source 2:   {s2_path}")
     logger.info(f"  Source 3:   {s3_path}")
     logger.info(f"  Candidate:  {candidate_out}")
     logger.info(f"  Matching:   {matching_out}")
+    logger.info(f"  Model Type: {model_type}")
     logger.info("=" * 75)
 
     # 1. Load or train model
-    clf = train_and_cache_model(sample_dir="sample_data", model_save_path=model_path)
+    clf = train_and_cache_model(
+        sample_dir="sample_data",
+        model_save_path=model_path,
+        model_type=model_type,
+        force_retrain=force_retrain,
+    )
 
     # 2. Ingest datasets
     t_load = time.time()
@@ -309,7 +328,7 @@ def execute_full_pipeline(
         )
         candidates_dict.update(cands)
 
-    export_candidate_pairs(candidates_dict, candidate_out)
+    export_candidate_pairs(candidates_dict, candidate_out, all_s1_ids=s1_prep["entity_id"].tolist())
     logger.info(f"Blocking stage completed in {time.time() - t_block:.2f}s")
 
     # Evaluate Candidate Recall if ground truth exists

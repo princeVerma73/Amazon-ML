@@ -103,9 +103,15 @@ def main() -> None:
         help="Path for final matching results TSV output (default: output/matching_results.tsv).",
     )
     parser.add_argument(
+        "--model-type",
+        choices=["catboost", "xgboost"],
+        default="catboost",
+        help="Classifier engine: 'catboost' (NVIDIA GPU accelerated, Experiment B) or 'xgboost' (Experiment C).",
+    )
+    parser.add_argument(
         "--model-path",
-        default="models/xgb_ber_model.joblib",
-        help="Path for cached/trained XGBoost model.",
+        default=None,
+        help="Path for cached/trained model (default: models/<model_type>_ber_model.joblib).",
     )
     parser.add_argument(
         "--chunk-size",
@@ -136,7 +142,16 @@ def main() -> None:
         default=None,
         help="Limit S1 queries per country for fast benchmark/sanity check.",
     )
+    parser.add_argument(
+        "--force-retrain",
+        action="store_true",
+        help="Force retraining classifier on sample_data even if cached model exists.",
+    )
     args = parser.parse_args()
+
+    model_path = args.model_path or (
+        "models/catboost_ber_model.joblib" if args.model_type == "catboost" else "models/xgb_ber_model.joblib"
+    )
 
     if args.mode == "sample":
         s1_path = "sample_data/sample_source1.tsv"
@@ -158,13 +173,15 @@ def main() -> None:
         s3_path=s3_path,
         candidate_out=args.candidate_out,
         matching_out=args.matching_out,
-        model_path=args.model_path,
+        model_path=model_path,
+        model_type=args.model_type,
         gt_path=gt_path,
         chunk_size=args.chunk_size,
         top_k=args.top_k,
         min_sim=args.min_sim,
         country_filter=args.country,
         limit=args.limit,
+        force_retrain=args.force_retrain,
     )
 
     # Validate output files

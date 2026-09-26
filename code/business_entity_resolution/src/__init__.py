@@ -25,6 +25,7 @@ from .feature_extraction import (
 )
 from .classifier import (
     BERClassifier,
+    CatBoostBERClassifier,
     compute_instance_macro_f05,
     export_matching_results,
 )
@@ -49,6 +50,7 @@ __all__ = [
     "compute_pair_features",
     "build_candidate_feature_matrix",
     "BERClassifier",
+    "CatBoostBERClassifier",
     "compute_instance_macro_f05",
     "export_matching_results",
 ]

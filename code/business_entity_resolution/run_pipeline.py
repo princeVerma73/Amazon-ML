@@ -102,9 +102,15 @@ def main() -> None:
         help="Path for final matching results TSV output.",
     )
     parser.add_argument(
+        "--model-type",
+        choices=["catboost", "xgboost"],
+        default="catboost",
+        help="Classifier engine: 'catboost' (NVIDIA GPU accelerated, Experiment B) or 'xgboost' (Experiment C).",
+    )
+    parser.add_argument(
         "--model-path",
-        default=os.path.join(workspace_dir, "models", "lgbm_ber_model.joblib"),
-        help="Path for cached/trained LightGBM model.",
+        default=None,
+        help="Path for cached/trained model (default: models/<model_type>_ber_model.joblib).",
     )
     parser.add_argument(
         "--chunk-size",
@@ -115,16 +121,22 @@ def main() -> None:
     parser.add_argument(
         "--top-k",
         type=int,
-        default=35,
-        help="Top-K candidates per entity during blocking (default: 35).",
+        default=20,
+        help="Top-K candidates per entity during blocking (default: 20).",
     )
     parser.add_argument(
         "--min-sim",
         type=float,
-        default=0.12,
-        help="Minimum cosine similarity for candidates (default: 0.12).",
+        default=0.10,
+        help="Minimum cosine similarity for candidates (default: 0.10).",
     )
     args = parser.parse_args()
+
+    model_path = args.model_path or (
+        os.path.join(workspace_dir, "models", "catboost_ber_model.joblib")
+        if args.model_type == "catboost"
+        else os.path.join(workspace_dir, "models", "xgb_ber_model.joblib")
+    )
 
     if args.mode == "sample":
         s1_path = os.path.join(workspace_dir, "sample_data", "sample_source1.tsv")
@@ -146,7 +158,8 @@ def main() -> None:
         s3_path=s3_path,
         candidate_out=args.candidate_out,
         matching_out=args.matching_out,
-        model_path=args.model_path,
+        model_path=model_path,
+        model_type=args.model_type,
         gt_path=gt_path,
         chunk_size=args.chunk_size,
         top_k=args.top_k,

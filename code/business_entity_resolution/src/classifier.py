@@ -389,6 +389,212 @@ class BERClassifier:
         return preds_map
 
 
+class CatBoostBERClassifier:
+    """
+    Experiment B: Pairwise classification and inference engine utilizing CatBoost GBDT
+    accelerated on NVIDIA RTX GPU (task_type='GPU') with oblivious decision trees and
+    asymmetric precision loss tuning for Macro F0.5.
+    """
+
+    __module__ = "classifier"
+
+    def __init__(
+        self,
+        iterations: int = 1000,
+        learning_rate: float = 0.04,
+        depth: int = 6,
+        loss_function: str = "Logloss",
+        eval_metric: str = "Logloss",
+        class_weights: Optional[List[float]] = None,
+        task_type: str = "GPU",
+        random_seed: int = 42,
+        early_stopping_rounds: int = 50,
+        verbose: int = 50,
+    ) -> None:
+        self.iterations = iterations
+        self.learning_rate = learning_rate
+        self.depth = depth
+        self.loss_function = loss_function
+        self.eval_metric = eval_metric
+        # Downweight positive class to 0.6 to prioritize precision for Macro F0.5
+        self.class_weights = class_weights if class_weights is not None else [1.0, 0.6]
+        self.task_type = task_type
+        self.random_seed = random_seed
+        self.early_stopping_rounds = early_stopping_rounds
+        self.verbose = verbose
+
+        try:
+            import catboost as cb
+            self.model = cb.CatBoostClassifier(
+                iterations=self.iterations,
+                learning_rate=self.learning_rate,
+                depth=self.depth,
+                loss_function=self.loss_function,
+                eval_metric=self.eval_metric,
+                class_weights=self.class_weights,
+                task_type=self.task_type,
+                random_seed=self.random_seed,
+                early_stopping_rounds=self.early_stopping_rounds,
+                verbose=self.verbose,
+            )
+        except Exception as e:
+            logger.warning(f"CatBoost GPU initialization encountered ({e}). Falling back to multi-threaded CPU...")
+            import catboost as cb
+            self.task_type = "CPU"
+            self.model = cb.CatBoostClassifier(
+                iterations=self.iterations,
+                learning_rate=self.learning_rate,
+                depth=self.depth,
+                loss_function=self.loss_function,
+                eval_metric=self.eval_metric,
+                class_weights=self.class_weights,
+                task_type="CPU",
+                thread_count=-1,
+                random_seed=self.random_seed,
+                early_stopping_rounds=self.early_stopping_rounds,
+                verbose=self.verbose,
+            )
+
+        self.best_th_link = 0.83
+        self.best_th_singleton = 0.20
+        self.best_iteration_: Optional[int] = None
+        self.best_score_: Optional[float] = None
+        self.training_duration_seconds_: float = 0.0
+
+    def train_and_evaluate(
+        self,
+        meta_df: pd.DataFrame,
+        features_df: pd.DataFrame,
+        ground_truth_map: Dict[str, Set[str]],
+        test_size: float = 0.20,
+        checkpoint_path: str = "models/catboost_ber_model.joblib",
+    ) -> Dict[str, Any]:
+        """
+        Train CatBoost with live GPU iteration logging, auto-checkpointing,
+        and 2D dual-threshold grid search.
+        """
+        train_start = time.time()
+        logger.info("Constructing binary labels for candidate pairs...")
+        labels = [
+            1 if target_id in ground_truth_map.get(s1_id, set()) else 0
+            for s1_id, target_id in zip(meta_df["source1_entity_id"], meta_df["target_entity_id"])
+        ]
+        y = np.array(labels, dtype=np.int32)
+        n_pos = int(y.sum())
+        n_neg = len(y) - n_pos
+        logger.info(
+            f"Feature dataset: {len(y):,} pairs ({n_pos:,} Positives, {n_neg:,} Negatives | "
+            f"Positive Ratio: {n_pos/len(y)*100:.2f}%)"
+        )
+
+        unique_s1 = np.array(sorted(meta_df["source1_entity_id"].unique()))
+        train_s1, val_s1 = train_test_split(unique_s1, test_size=test_size, random_state=42)
+        train_s1_set = set(train_s1)
+        val_s1_set = set(val_s1)
+
+        train_mask = meta_df["source1_entity_id"].isin(train_s1_set).to_numpy()
+        val_mask = meta_df["source1_entity_id"].isin(val_s1_set).to_numpy()
+
+        X_train, y_train = features_df[train_mask], y[train_mask]
+        X_val, y_val = features_df[val_mask], y[val_mask]
+        val_meta = meta_df[val_mask].reset_index(drop=True)
+
+        logger.info(
+            f"Grouped Split: {len(train_s1):,} Train S1 ({len(X_train):,} pairs), "
+            f"{len(val_s1):,} Val S1 ({len(X_val):,} pairs) | Device: {self.task_type}"
+        )
+
+        logger.info(f"\nStarting CatBoost training on {self.task_type} (iterations={self.iterations}, depth={self.depth})...")
+        self.model.fit(
+            X_train,
+            y_train,
+            eval_set=(X_val, y_val),
+            verbose=self.verbose,
+        )
+
+        self.training_duration_seconds_ = time.time() - train_start
+        self.best_iteration_ = getattr(self.model, "get_best_iteration", lambda: self.iterations)()
+        best_score_dict = getattr(self.model, "get_best_score", lambda: {})()
+        self.best_score_ = best_score_dict.get("validation", {}).get("Logloss", 0.0)
+
+        logger.info(
+            f"\nCatBoost training finished in {self.training_duration_seconds_:.2f}s! "
+            f"Optimal Iteration: {self.best_iteration_}, Best Validation Loss: {self.best_score_:.5f}"
+        )
+
+        os.makedirs(os.path.dirname(os.path.abspath(checkpoint_path)), exist_ok=True)
+        joblib.dump(self, checkpoint_path)
+        logger.info(f"Auto-checkpointed model to: {checkpoint_path}")
+
+        val_probs = self.model.predict_proba(X_val)[:, 1]
+
+        best_link, best_sing, opt_f05, opt_p, opt_r, top_3 = grid_search_thresholds(
+            val_meta, val_probs, val_s1, ground_truth_map
+        )
+        self.best_th_link = best_link
+        self.best_th_singleton = best_sing
+
+        joblib.dump(self, checkpoint_path)
+        logger.info(f"Updated CatBoost checkpoint with locked optimal thresholds: {checkpoint_path}")
+
+        try:
+            importances = self.model.get_feature_importance()
+            imp_df = pd.DataFrame({"feature": FEATURE_COLUMNS, "importance": importances}).sort_values(
+                by="importance", ascending=False
+            )
+            top_features_str = ", ".join([f"{r['feature']} ({r['importance']:.3f})" for _, r in imp_df.head(5).iterrows()])
+            logger.info(f"Top 5 CatBoost Features by Importance: {top_features_str}")
+        except Exception:
+            pass
+
+        return {
+            "training_duration_seconds": self.training_duration_seconds_,
+            "optimal_iteration": self.best_iteration_,
+            "best_validation_logloss": self.best_score_,
+            "best_th_link": self.best_th_link,
+            "best_th_singleton": self.best_th_singleton,
+            "optimized_macro_f05": opt_f05,
+            "optimized_precision": opt_p,
+            "optimized_recall": opt_r,
+            "top_3_candidates": top_3,
+            "checkpoint_path": checkpoint_path,
+        }
+
+    def predict_matches(
+        self,
+        meta_df: pd.DataFrame,
+        features_df: pd.DataFrame,
+        all_s1_ids: Sequence[str],
+    ) -> Dict[str, List[str]]:
+        """Generate final predictions map using CatBoost and learned optimal thresholds."""
+        probs = self.model.predict_proba(features_df)[:, 1]
+        meta_with_prob = meta_df.copy()
+        meta_with_prob["prob"] = probs
+
+        grouped = meta_with_prob.groupby("source1_entity_id")
+        cand_dict = {
+            s1_id: (group["target_entity_id"].tolist(), group["prob"].to_numpy())
+            for s1_id, group in grouped
+        }
+
+        preds_map: Dict[str, List[str]] = {}
+        for s1_id in all_s1_ids:
+            if s1_id not in cand_dict:
+                preds_map[s1_id] = []
+                continue
+
+            target_ids, p_arr = cand_dict[s1_id]
+            max_p = p_arr.max() if len(p_arr) > 0 else 0.0
+
+            if max_p < self.best_th_singleton:
+                preds_map[s1_id] = []
+            else:
+                valid_mask = p_arr >= self.best_th_link
+                preds_map[s1_id] = [target_ids[i] for i, valid in enumerate(valid_mask) if valid]
+
+        return preds_map
+
+
 def export_matching_results(
     predictions_map: Dict[str, List[str]],
     all_s1_ids: Sequence[str],

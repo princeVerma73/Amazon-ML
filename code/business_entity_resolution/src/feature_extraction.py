@@ -192,13 +192,19 @@ def compute_pair_features(
     raw_name2: Optional[str] = None,
     domain1: Optional[str] = None,
     domain2: Optional[str] = None,
+    nums1: Optional[Set[str]] = None,
+    nums2: Optional[Set[str]] = None,
+    pins1: Optional[Set[str]] = None,
+    pins2: Optional[Set[str]] = None,
+    pincode_house1: Optional[Set[str]] = None,
+    pincode_house2: Optional[Set[str]] = None,
 ) -> List[float]:
     """
     Compute dense feature vector for a single (S1, Target) entity pair.
     
     Includes SIMD string similarities, address similarities, numeric token Jaccard,
     postal PIN exact match, postal+house number overlap match, domain stem match,
-    and script mismatch indicator.
+    and script mismatch indicator. Supports pre-cached token sets for ultra-high throughput.
     """
     # 1. Name String Similarities (SIMD C++ via RapidFuzz)
     n_sort = fuzz.token_sort_ratio(name1, name2) / 100.0
@@ -216,23 +222,27 @@ def compute_pair_features(
         a_set = 0.0
         a_jw = 0.0
 
-    # 3. Numeric & Postal Token Overlap
-    joint1 = f"{name1} {addr1}"
-    joint2 = f"{name2} {addr2}"
-    nums1 = extract_numeric_tokens(joint1)
-    nums2 = extract_numeric_tokens(joint2)
+    # 3. Numeric & Postal Token Overlap (using pre-cached tokens when available)
+    if nums1 is None:
+        nums1 = extract_numeric_tokens(f"{name1} {addr1}")
+    if nums2 is None:
+        nums2 = extract_numeric_tokens(f"{name2} {addr2}")
     if nums1 and nums2:
         num_overlap = len(nums1.intersection(nums2)) / len(nums1.union(nums2))
     else:
         num_overlap = 0.0
 
-    pins1 = extract_pin_tokens(addr1)
-    pins2 = extract_pin_tokens(addr2)
+    if pins1 is None:
+        pins1 = extract_pin_tokens(addr1)
+    if pins2 is None:
+        pins2 = extract_pin_tokens(addr2)
     pin_match = 1.0 if (pins1 and pins2 and len(pins1.intersection(pins2)) > 0) else 0.0
 
     # 4. Numeric / Pincode & House/Plot Overlap (1.0 if any overlap, else 0.0)
-    pincode_house1 = extract_numeric_pincode_tokens(addr1)
-    pincode_house2 = extract_numeric_pincode_tokens(addr2)
+    if pincode_house1 is None:
+        pincode_house1 = extract_numeric_pincode_tokens(addr1)
+    if pincode_house2 is None:
+        pincode_house2 = extract_numeric_pincode_tokens(addr2)
     num_pin_match = compute_numeric_pincode_match(pincode_house1, pincode_house2)
 
     # 5. Domain Match Logic (1.0 if non-empty domain stems match, else 0.0)
@@ -329,6 +339,20 @@ def build_candidate_feature_matrix(
     pairs_target: List[str] = []
     feature_rows: List[List[float]] = []
 
+    # Pre-extract token sets for reference S1 entities
+    s1_token_cache: Dict[str, Tuple[Set[str], Set[str], Set[str]]] = {}
+    for s1_id in candidate_dict.keys():
+        if s1_id in s1_map:
+            n1, a1, _, _ = s1_map[s1_id]
+            s1_token_cache[s1_id] = (
+                extract_numeric_tokens(f"{n1} {a1}"),
+                extract_pin_tokens(a1),
+                extract_numeric_pincode_tokens(a1),
+            )
+
+    # Dynamic target token cache: populated once per unique target seen
+    target_token_cache: Dict[str, Tuple[Set[str], Set[str], Set[str]]] = {}
+
     if show_progress:
         try:
             from tqdm import tqdm
@@ -347,11 +371,21 @@ def build_candidate_feature_matrix(
         if s1_id not in s1_map or not candidate_ids:
             continue
         n1, a1, raw_n1, dom1 = s1_map[s1_id]
+        nums1, pins1, pinh1 = s1_token_cache[s1_id]
 
         for rank, target_id in enumerate(candidate_ids, start=1):
             if target_id not in target_map:
                 continue
             n2, a2, missing2, raw_n2, dom2 = target_map[target_id]
+
+            if target_id not in target_token_cache:
+                target_token_cache[target_id] = (
+                    extract_numeric_tokens(f"{n2} {a2}"),
+                    extract_pin_tokens(a2),
+                    extract_numeric_pincode_tokens(a2),
+                )
+            nums2, pins2, pinh2 = target_token_cache[target_id]
+
             feats = compute_pair_features(
                 name1=n1,
                 addr1=a1,
@@ -363,6 +397,12 @@ def build_candidate_feature_matrix(
                 raw_name2=raw_n2,
                 domain1=dom1,
                 domain2=dom2,
+                nums1=nums1,
+                nums2=nums2,
+                pins1=pins1,
+                pins2=pins2,
+                pincode_house1=pinh1,
+                pincode_house2=pinh2,
             )
 
             pairs_s1.append(s1_id)

@@ -34,8 +34,9 @@ data_cache/
 *.joblib
 
 # ==========================================
-# Python / Virtual Environments
+# Python / Virtual Environments & Model Logs
 # ==========================================
+catboost_info/
 __pycache__/
 *.py[cod]
 *$py.class

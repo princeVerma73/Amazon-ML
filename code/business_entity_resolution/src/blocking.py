@@ -113,16 +113,22 @@ class DynamicTFIDFBlocker:
         # -----------------------------------------------------------------------
         # 1. Fit Stage 1: Coarse Word TF-IDF Vectorizer
         # -----------------------------------------------------------------------
+        w_min_df = self.word_min_df if n_targets >= self.word_min_df else 1
+        w_max_df = 1.0 if (isinstance(self.word_max_df, float) and n_targets * self.word_max_df < w_min_df) else self.word_max_df
+
+        c_min_df = self.char_min_df if n_targets >= self.char_min_df else 1
+        c_max_df = 1.0 if (isinstance(self.char_max_df, float) and n_targets * self.char_max_df < c_min_df) else self.char_max_df
+
         logger.info(
             f"[{country_name}] Fitting Stage 1 Word TF-IDF on {n_targets:,} target records "
-            f"({self.word_analyzer} {self.word_ngram_range}, max_df={self.word_max_df})..."
+            f"({self.word_analyzer} {self.word_ngram_range}, max_df={w_max_df})..."
         )
         t_w0 = time.time()
         vec_word = TfidfVectorizer(
             analyzer=self.word_analyzer,
             ngram_range=self.word_ngram_range,
-            min_df=self.word_min_df,
-            max_df=self.word_max_df,
+            min_df=w_min_df,
+            max_df=w_max_df,
             sublinear_tf=self.sublinear_tf,
             dtype=np.float32,
         )
@@ -139,14 +145,14 @@ class DynamicTFIDFBlocker:
         # -----------------------------------------------------------------------
         logger.info(
             f"[{country_name}] Fitting Stage 2 Char TF-IDF on {n_targets:,} target records "
-            f"({self.char_analyzer} {self.char_ngram_range}, max_df={self.char_max_df}, max_features={self.char_max_features:,})..."
+            f"({self.char_analyzer} {self.char_ngram_range}, max_df={c_max_df}, max_features={self.char_max_features:,})..."
         )
         t_c0 = time.time()
         vec_char = TfidfVectorizer(
             analyzer=self.char_analyzer,
             ngram_range=self.char_ngram_range,
-            min_df=self.char_min_df,
-            max_df=self.char_max_df,
+            min_df=c_min_df,
+            max_df=c_max_df,
             max_features=self.char_max_features,
             sublinear_tf=self.sublinear_tf,
             dtype=np.float32,
@@ -282,11 +288,17 @@ class DynamicTFIDFBlocker:
         target_texts = target_df_country["clean_joint"].tolist()
         target_ids = np.array(target_df_country["entity_id"].tolist())
 
+        w_min_df = self.word_min_df if n_targets >= self.word_min_df else 1
+        w_max_df = 1.0 if (isinstance(self.word_max_df, float) and n_targets * self.word_max_df < w_min_df) else self.word_max_df
+
+        c_min_df = self.char_min_df if n_targets >= self.char_min_df else 1
+        c_max_df = 1.0 if (isinstance(self.char_max_df, float) and n_targets * self.char_max_df < c_min_df) else self.char_max_df
+
         vec_word = TfidfVectorizer(
             analyzer=self.word_analyzer,
             ngram_range=self.word_ngram_range,
-            min_df=self.word_min_df,
-            max_df=self.word_max_df,
+            min_df=w_min_df,
+            max_df=w_max_df,
             sublinear_tf=self.sublinear_tf,
             dtype=np.float32,
         )
@@ -297,8 +309,8 @@ class DynamicTFIDFBlocker:
         vec_char = TfidfVectorizer(
             analyzer=self.char_analyzer,
             ngram_range=self.char_ngram_range,
-            min_df=self.char_min_df,
-            max_df=self.char_max_df,
+            min_df=c_min_df,
+            max_df=c_max_df,
             max_features=self.char_max_features,
             sublinear_tf=self.sublinear_tf,
             dtype=np.float32,
@@ -459,18 +471,29 @@ class DynamicTFIDFBlocker:
         return all_candidates
 
 
-def export_candidate_pairs(candidates_dict: Dict[str, List[str]], output_path: str) -> None:
+def export_candidate_pairs(
+    candidates_dict: Dict[str, List[str]],
+    output_path: str,
+    all_s1_ids: Optional[Sequence[str]] = None,
+) -> None:
     """
     Export candidate pairs TSV file strictly matching the official schema.
     Header: source1_entity_id\tcandidate_entity_ids
     """
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-    logger.info(f"Writing {len(candidates_dict):,} candidate rows to {output_path}...")
+    keys = all_s1_ids if all_s1_ids is not None else list(candidates_dict.keys())
+    logger.info(f"Writing {len(keys):,} candidate rows to {output_path}...")
     
     with open(output_path, "w", encoding="utf-8") as f:
         f.write("source1_entity_id\tcandidate_entity_ids\n")
-        for s1_id, cands in candidates_dict.items():
-            cand_str = ",".join(cands)
+        for s1_id in keys:
+            cands = candidates_dict.get(s1_id, [])
+            if isinstance(cands, str):
+                cand_str = cands
+            elif isinstance(cands, (list, tuple, set)):
+                cand_str = ",".join(str(c) for c in cands if str(c).strip())
+            else:
+                cand_str = ""
             f.write(f"{s1_id}\t{cand_str}\n")
             
     logger.info(f"Export completed: {output_path}")
