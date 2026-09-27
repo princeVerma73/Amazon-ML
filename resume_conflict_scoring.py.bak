@@ -1,0 +1,377 @@
+"""
+Resume Conflict-Aware SIMD Scoring Engine from Verified Checkpoint (Chunk 10 / index 900,000).
+
+Requirements:
+- Preserves output/matching_results.tsv.tmp
+- Appends to .tmp; does not overwrite
+- Starts at index 900,000 (Chunk 10) through 1,732,544 (Chunk 18)
+- Flushes after every chunk
+- Verifies exact line count (1,732,545 lines = header + 1,732,544 entities)
+- Atomically replaces matching_results.tsv only after full verification
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import re
+import sys
+import time
+from typing import Dict, List, Optional, Set, Tuple
+
+import joblib
+import numpy as np
+import polars as pl
+from rapidfuzz import distance, fuzz
+from tqdm import tqdm
+
+sys.path.insert(0, ".")
+sys.path.insert(0, "code/business_entity_resolution/src")
+from normalizer import clean_legal_suffixes, normalize_text, clean_address, extract_domain_stem
+from feature_extraction import (
+    extract_numeric_tokens, extract_pin_tokens, extract_numeric_pincode_tokens,
+    compute_numeric_pincode_match, compute_domain_match, compute_script_mismatch
+)
+from train_conflict_model import US_STATES, get_state, extract_primary_number
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("ResumeScorer")
+
+def clean_name(s: str) -> str:
+    return clean_legal_suffixes(normalize_text(s))
+
+def verify_checkpoint(tmp_path: str, expected_lines: int, expected_last_id: str):
+    logger.info(f"Verifying existing checkpoint: {tmp_path}...")
+    if not os.path.exists(tmp_path):
+        raise FileNotFoundError(f"Checkpoint file {tmp_path} does not exist!")
+
+    with open(tmp_path, "rb") as f:
+        line_count = sum(1 for _ in f)
+
+    if line_count != expected_lines:
+        raise ValueError(
+            f"Checkpoint line count mismatch: expected {expected_lines:,}, found {line_count:,}!"
+        )
+
+    # Check last line
+    with open(tmp_path, "r", encoding="utf-8") as f:
+        # Seek from end
+        f.seek(max(0, os.path.getsize(tmp_path) - 2048))
+        last_lines = [l.strip() for l in f.readlines() if l.strip()]
+        last_line = last_lines[-1] if last_lines else ""
+        last_entity_id = last_line.split("\t")[0]
+
+    if last_entity_id != expected_last_id:
+        raise ValueError(
+            f"Checkpoint last entity ID mismatch: expected {expected_last_id}, found {last_entity_id}!"
+        )
+
+    logger.info(f"Checkpoint VERIFIED: {line_count:,} lines, last entity {last_entity_id} matches index 899,999.")
+
+def main():
+    parser = argparse.ArgumentParser(description="Resume Conflict-Aware BER Scoring")
+    parser.add_argument("--test-dir", default="student_resource/dataset/test", help="Path to test directory")
+    parser.add_argument("--candidate-file", default="output/candidate_pairs.tsv", help="Path to candidate pairs TSV")
+    parser.add_argument("--matching-file", default="output/matching_results.tsv", help="Path to output matching TSV")
+    parser.add_argument("--tmp-file", default="output/matching_results.tsv.tmp", help="Path to temporary matching TSV")
+    parser.add_argument("--model-path", default="models/catboost_conflict_aware.joblib", help="Path to CatBoost model")
+    parser.add_argument("--chunk-size", type=int, default=100000, help="S1 chunk size for streaming")
+    parser.add_argument("--start-idx", type=int, default=900000, help="Entity index to resume from")
+    parser.add_argument("--th-link", type=float, default=0.70, help="Probability link threshold")
+    parser.add_argument("--rel-margin", type=float, default=0.75, help="Relative probability margin")
+    parser.add_argument("--th-singleton", type=float, default=0.35, help="Singleton confidence floor")
+    parser.add_argument("--max-none", type=int, default=1, help="Max missing-address candidates per entity")
+    parser.add_argument("--min-none-name-sim", type=float, default=0.90, help="Min name similarity for missing address")
+    args = parser.parse_args()
+
+    t_total_start = time.time()
+    logger.info("=" * 75)
+    logger.info("AMAZON ML CHALLENGE 2026: RESUMING CONFLICT-AWARE INFERENCE")
+    logger.info("=" * 75)
+    logger.info(f"Resume Index      : {args.start_idx:,} (Chunk {args.start_idx // args.chunk_size + 1}/18)")
+    logger.info(f"Temporary File    : {args.tmp_file}")
+    logger.info(f"Final Output File : {args.matching_file}")
+    logger.info(f"Model Path        : {args.model_path}")
+    logger.info(f"Link Threshold    : {args.th_link}")
+    logger.info(f"Relative Margin   : {args.rel_margin}")
+    logger.info(f"Singleton Floor   : {args.th_singleton}")
+    logger.info(f"Max None Allowed  : {args.max_none}")
+    logger.info("=" * 75)
+
+    # 1. Step 1: Strict Checkpoint Verification
+    expected_lines = args.start_idx + 1  # 1 header + 900,000 entities
+    expected_last_id = "S1-525757309"
+    verify_checkpoint(args.tmp_file, expected_lines, expected_last_id)
+
+    # 2. Step 2: Load CatBoost model
+    logger.info(f"Loading conflict-aware model from {args.model_path}...")
+    model_payload = joblib.load(args.model_path)
+    if isinstance(model_payload, dict):
+        cb_model = model_payload["model"]
+    else:
+        cb_model = getattr(model_payload, "model", model_payload)
+    logger.info(f"Model loaded successfully ({cb_model.tree_count_} trees).")
+
+    # 3. Step 3: Ingest Target Datasets (S2 + S3) using Polars
+    t_targets = time.time()
+    s2_path = os.path.join(args.test_dir, "test_source2.tsv")
+    s3_path = os.path.join(args.test_dir, "test_source3.tsv")
+    logger.info(f"Scanning target files via Polars ({s2_path}, {s3_path})...")
+
+    s2_df = pl.read_csv(s2_path, separator="\t")
+    s3_df = pl.read_csv(s3_path, separator="\t")
+    target_df = pl.concat([s2_df, s3_df])
+    logger.info(f"Loaded {len(target_df):,} total target records in {time.time() - t_targets:.2f}s.")
+
+    # 4. Step 4: Store raw targets in memory
+    logger.info("Storing raw target strings in memory...")
+    t_dict = time.time()
+    raw_targets: Dict[str, Tuple[str, str]] = {}
+    for row in tqdm(target_df.iter_rows(), total=len(target_df), desc="Reading Target Strings"):
+        raw_targets[row[0]] = (str(row[1] or ""), str(row[2] or ""))
+    logger.info(f"Loaded {len(raw_targets):,} raw targets in {time.time() - t_dict:.2f}s.")
+
+    # Target cache
+    target_cache: Dict[str, Tuple] = {}
+
+    def get_target_info(tid: str):
+        info = target_cache.get(tid)
+        if info is not None:
+            return info
+        raw = raw_targets.get(tid)
+        if raw is None:
+            return None
+        raw_name, raw_addr = raw
+        c_name = clean_name(raw_name)
+        c_addr = clean_address(raw_addr)
+        is_missing = 1.0 if not c_addr.strip() else 0.0
+        dom = extract_domain_stem(raw_name)
+        nums = extract_numeric_tokens(f"{c_name} {c_addr}")
+        pins = extract_pin_tokens(c_addr)
+        pin_houses = extract_numeric_pincode_tokens(c_addr)
+        st = get_state(raw_addr)
+        d_num = extract_primary_number(raw_addr)
+        words = set(c_name.split())
+        info = (c_name, c_addr, raw_name, is_missing, dom, nums, pins, pin_houses, st, d_num, words)
+        target_cache[tid] = info
+        return info
+
+    # 5. Step 5: Read S1 Data
+    s1_path = os.path.join(args.test_dir, "test_source1.tsv")
+    logger.info(f"Scanning Source 1 file: {s1_path}...")
+    s1_df = pl.read_csv(s1_path, separator="\t")
+    total_s1 = len(s1_df)
+    logger.info(f"Total Source 1 entities in dataset: {total_s1:,}")
+
+    # Confirm next entity
+    next_entity_id = s1_df[args.start_idx, "entity_id"]
+    logger.info(f"Confirmed starting entity at index {args.start_idx:,}: {next_entity_id}")
+
+    # 6. Step 6: Index Candidate Pairs
+    logger.info(f"Indexing candidate pairs from: {args.candidate_file}...")
+    t_cand = time.time()
+    cand_df = pl.read_csv(args.candidate_file, separator="\t")
+    cand_map: Dict[str, List[str]] = {}
+    for row in tqdm(cand_df.iter_rows(), total=len(cand_df), desc="Reading Candidates"):
+        raw_c = str(row[1] or "")
+        cand_map[row[0]] = [c.strip() for c in raw_c.split(",") if c.strip()]
+    logger.info(f"Candidate map loaded for {len(cand_map):,} entities in {time.time() - t_cand:.2f}s.")
+
+    # 7. Step 7: Open .tmp file in APPEND mode ("a")
+    logger.info(f"Opening {args.tmp_file} in APPEND mode ('a')...")
+    f_match = open(args.tmp_file, "a", encoding="utf-8", newline="\n")
+
+    chunk_size = args.chunk_size
+    start_chunk_idx = args.start_idx // chunk_size
+    num_chunks = (total_s1 + chunk_size - 1) // chunk_size
+
+    total_matches_resumed = 0
+    total_singletons_resumed = 0
+
+    logger.info(f"Beginning scoring from Chunk {start_chunk_idx + 1} to {num_chunks}...")
+    t_score_start = time.time()
+
+    for chunk_idx in range(start_chunk_idx, num_chunks):
+        c_start = chunk_idx * chunk_size
+        c_end = min(total_s1, c_start + chunk_size)
+        chunk_df = s1_df.slice(c_start, c_end - c_start)
+        t_chunk = time.time()
+
+        chunk_features = []
+        chunk_pairs_meta = []
+
+        for row in chunk_df.iter_rows():
+            s1_id, raw_name, raw_addr = row[0], str(row[1] or ""), str(row[2] or "")
+            s1_cname = clean_name(raw_name)
+            s1_caddr = clean_address(raw_addr)
+            s1_dom = extract_domain_stem(raw_name)
+            s1_nums = extract_numeric_tokens(f"{s1_cname} {s1_caddr}")
+            s1_pins = extract_pin_tokens(s1_caddr)
+            s1_pin_houses = extract_numeric_pincode_tokens(s1_caddr)
+            s1_st = get_state(raw_addr)
+            s1_dnum = extract_primary_number(raw_addr)
+            s1_words = set(s1_cname.split())
+
+            raw_cands = cand_map.get(s1_id, [])
+
+            for cid in raw_cands:
+                t_info = get_target_info(cid)
+                if not t_info:
+                    continue
+                (t_cname, t_caddr, t_rname, is_missing, t_dom, 
+                 t_nums, t_pins, t_pin_houses, t_st, t_dnum, t_words) = t_info
+
+                n_sort = fuzz.token_sort_ratio(s1_cname, t_cname) / 100.0
+                n_set = fuzz.token_set_ratio(s1_cname, t_cname) / 100.0
+                n_jw = distance.JaroWinkler.similarity(s1_cname, t_cname)
+                n_lev = distance.Levenshtein.normalized_similarity(s1_cname, t_cname)
+
+                if s1_caddr and t_caddr:
+                    a_sort = fuzz.token_sort_ratio(s1_caddr, t_caddr) / 100.0
+                    a_set = fuzz.token_set_ratio(s1_caddr, t_caddr) / 100.0
+                    a_jw = distance.JaroWinkler.similarity(s1_caddr, t_caddr)
+                else:
+                    a_sort = a_set = a_jw = 0.0
+
+                if s1_nums and t_nums:
+                    num_overlap = len(s1_nums & t_nums) / len(s1_nums | t_nums)
+                else:
+                    num_overlap = 0.0
+
+                pin_match = 1.0 if (s1_pins and t_pins and (s1_pins & t_pins)) else 0.0
+                num_pin_match = compute_numeric_pincode_match(s1_pin_houses, t_pin_houses)
+                dom_match = compute_domain_match(s1_dom, t_dom, name1=s1_cname, name2=t_cname)
+                script_mismatch = compute_script_mismatch(raw_name, t_rname)
+
+                len_diff_n = abs(len(s1_cname) - len(t_cname)) / max(len(s1_cname), len(t_cname), 1)
+                len_diff_a = abs(len(s1_caddr) - len(t_caddr)) / max(len(s1_caddr), len(t_caddr), 1) if (s1_caddr and t_caddr) else 1.0
+
+                state_conflict = 1.0 if (s1_st and t_st and s1_st != t_st) else 0.0
+                door_conflict = 1.0 if (s1_dnum is not None and t_dnum is not None and s1_dnum != t_dnum and a_sort >= 0.70) else 0.0
+                extra_words = float(len(t_words - s1_words))
+
+                feats = [
+                    n_sort, n_set, n_jw, n_lev,
+                    a_sort, a_set, a_jw,
+                    num_overlap, pin_match, num_pin_match,
+                    dom_match, script_mismatch,
+                    len_diff_n, len_diff_a,
+                    is_missing,
+                    state_conflict, door_conflict, extra_words
+                ]
+
+                chunk_features.append(feats)
+                chunk_pairs_meta.append((s1_id, cid, is_missing, n_sort))
+
+        # Batch CatBoost Inference
+        if chunk_features:
+            X_chunk = np.array(chunk_features, dtype=np.float32)
+            probs = cb_model.predict_proba(X_chunk)[:, 1]
+        else:
+            probs = np.array([], dtype=np.float32)
+
+        # Aggregate probabilities per S1 entity
+        from collections import defaultdict
+        s1_probs = defaultdict(list)
+        for (s1_id, cid, is_miss, n_s), prob in zip(chunk_pairs_meta, probs):
+            s1_probs[s1_id].append((cid, prob, is_miss, n_s))
+
+        # Write matching results
+        chunk_matches = 0
+        chunk_singletons = 0
+        for row in chunk_df.iter_rows():
+            s1_id = row[0]
+            cand_score_list = s1_probs.get(s1_id, [])
+            if not cand_score_list:
+                f_match.write(f"{s1_id}\t\n")
+                chunk_singletons += 1
+                continue
+
+            cand_score_list.sort(key=lambda x: x[1], reverse=True)
+            max_p = cand_score_list[0][1]
+
+            if max_p < args.th_singleton:
+                f_match.write(f"{s1_id}\t\n")
+                chunk_singletons += 1
+            else:
+                matches = []
+                none_count = 0
+                for cid, p, is_miss, n_s in cand_score_list:
+                    if p >= args.th_link and p >= args.rel_margin * max_p:
+                        if is_miss == 1.0:
+                            if none_count >= args.max_none:
+                                continue
+                            if n_s < args.min_none_name_sim:
+                                continue
+                            none_count += 1
+                        matches.append(cid)
+
+                if not matches:
+                    f_match.write(f"{s1_id}\t\n")
+                    chunk_singletons += 1
+                else:
+                    f_match.write(f"{s1_id}\t{','.join(matches)}\n")
+                    chunk_matches += len(matches)
+
+        f_match.flush()
+        total_matches_resumed += chunk_matches
+        total_singletons_resumed += chunk_singletons
+
+        elapsed_chunk = time.time() - t_chunk
+        total_elapsed = time.time() - t_score_start
+        chunks_done = chunk_idx - start_chunk_idx + 1
+        chunks_left = num_chunks - chunk_idx - 1
+        avg_chunk_time = total_elapsed / chunks_done
+        eta_seconds = avg_chunk_time * chunks_left
+
+        logger.info(
+            f"Chunk {chunk_idx + 1:2d}/{num_chunks:2d} ({c_start:,}..{c_end:,}) "
+            f"processed in {elapsed_chunk:.1f}s | Matches: {chunk_matches:,} | "
+            f"ETA: {eta_seconds / 60:.1f} min (avg {avg_chunk_time:.1f}s/chunk)"
+        )
+
+    f_match.close()
+    logger.info("Scoring loop completed. Verifying output integrity before replacement...")
+
+    # 8. Step 8: Strict Final Line Count Verification
+    with open(args.tmp_file, "rb") as f:
+        final_line_count = sum(1 for _ in f)
+
+    expected_final_lines = total_s1 + 1  # 1 header + 1,732,544 rows
+    logger.info(f"Verification: Found {final_line_count:,} lines (Expected: {expected_final_lines:,}).")
+
+    if final_line_count != expected_final_lines:
+        logger.error(
+            f"CRITICAL ERROR: Line count mismatch! Found {final_line_count:,}, expected {expected_final_lines:,}."
+        )
+        logger.error(f"Checkpoint {args.tmp_file} is preserved. Will NOT replace {args.matching_file}.")
+        sys.exit(1)
+
+    logger.info("Verification PASSED! Atomically replacing matching results file...")
+
+    # 9. Step 9: Atomic replacement
+    if os.path.exists(args.matching_file):
+        backup_path = args.matching_file + ".bak2"
+        if os.path.exists(backup_path):
+            os.remove(backup_path)
+        os.rename(args.matching_file, backup_path)
+        logger.info(f"Existing matching file backed up -> {backup_path}")
+
+    os.rename(args.tmp_file, args.matching_file)
+    logger.info(f"Atomic replacement complete -> {args.matching_file}")
+
+    total_resumed_time = time.time() - t_score_start
+    logger.info("=" * 75)
+    logger.info(f"ALL 18 CHUNKS COMPLETED SUCCESSFULLY in {total_resumed_time:.1f}s ({total_resumed_time / 60:.1f} minutes)!")
+    logger.info(f"Resumed Matches Written   : {total_matches_resumed:,}")
+    logger.info(f"Resumed Singletons Written: {total_singletons_resumed:,}")
+    logger.info(f"Final Submission File     : {args.matching_file}")
+    logger.info("=" * 75)
+
+if __name__ == "__main__":
+    main()

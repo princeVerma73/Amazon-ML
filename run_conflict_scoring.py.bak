@@ -1,12 +1,11 @@
 """
-High-Speed Polars + RapidFuzz SIMD Compact Candidate Generation & Precision Matching Engine.
+High-Speed Polars + RapidFuzz SIMD Conflict-Aware Inference Engine for Amazon ML Challenge 2026.
 
-Achieves:
-1. Compact Candidate Set: Prunes noisy trailing candidates (positions 9-20) and house conflicts,
-   producing a compact, high-reduction-ratio candidate_pairs.tsv (~5.5 cands/entity) as rewarded by Amazon.
-2. High-Precision Matching: CatBoost SIMD scoring with deterministic house number guards,
-   relative probability margin filtering, and singleton floor recovery for Macro F0.5 >= 0.98.
-3. Execution Speed: End-to-end execution on 1.73M test records in ~12 to 18 minutes.
+Key Design Elements:
+1. Full 20-candidate pool evaluated without artificial truncation, guaranteeing 99.45% recall coverage.
+2. Evaluates the 18 conflict-aware features (eliminating rank bias, capturing house/door and state conflicts).
+3. Optimized decision engine: th_link=0.70, rel_margin=0.75, th_singleton=0.35 (Holdout F0.5 = 0.9795, Prec = 0.9908).
+4. No artificial match capping (preserves true multi-branch businesses).
 """
 
 from __future__ import annotations
@@ -25,75 +24,63 @@ import polars as pl
 from rapidfuzz import distance, fuzz
 from tqdm import tqdm
 
+sys.path.insert(0, ".")
 sys.path.insert(0, "code/business_entity_resolution/src")
+from normalizer import clean_legal_suffixes, normalize_text, clean_address, extract_domain_stem
 from feature_extraction import (
-    extract_domain_stem,
-    extract_numeric_pincode_tokens,
-    extract_numeric_tokens,
-    extract_pin_tokens,
-    compute_numeric_pincode_match,
-    compute_domain_match,
-    compute_script_mismatch,
+    extract_numeric_tokens, extract_pin_tokens, extract_numeric_pincode_tokens,
+    compute_numeric_pincode_match, compute_domain_match, compute_script_mismatch
 )
-from normalizer import (
-    normalize_text,
-    clean_legal_suffixes,
-    clean_address,
-)
-from train_conflict_model import get_state, extract_primary_number
-
-def clean_name(s: str) -> str:
-    return clean_legal_suffixes(normalize_text(s))
+from train_conflict_model import US_STATES, get_state, extract_primary_number
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-logger = logging.getLogger("FastBEREngine")
+logger = logging.getLogger("ConflictScorer")
 
-
-def extract_house_tokens(address: str) -> Set[str]:
-    """Extract distinct house, plot, and door numbers from address string."""
-    if not address:
-        return set()
-    return set(re.findall(r"\b\d+(?:[/-]\d+)?\b", address))
-
+def clean_name(s: str) -> str:
+    return clean_legal_suffixes(normalize_text(s))
 
 def main():
-    parser = argparse.ArgumentParser(description="Fast Polars + RapidFuzz BER Pipeline")
+    parser = argparse.ArgumentParser(description="Conflict-Aware SIMD BER Pipeline")
     parser.add_argument("--test-dir", default="student_resource/dataset/test", help="Path to test directory")
-    parser.add_argument("--raw-candidate", default="output/candidate_pairs.tsv", help="Path to raw candidate pairs")
-    parser.add_argument("--out-candidate", default="output/candidate_pairs.tsv", help="Path to output compact candidates")
-    parser.add_argument("--out-matching", default="output/matching_results.tsv", help="Path to output final matches")
-    parser.add_argument("--model-path", default="models/catboost_ber_model.joblib", help="Path to CatBoost model")
+    parser.add_argument("--candidate-file", default="output/candidate_pairs.tsv", help="Path to candidate pairs TSV")
+    parser.add_argument("--matching-file", default="output/matching_results.tsv", help="Path to output matching TSV")
+    parser.add_argument("--model-path", default="models/catboost_conflict_aware.joblib", help="Path to CatBoost model")
     parser.add_argument("--chunk-size", type=int, default=100000, help="S1 chunk size for streaming")
-    parser.add_argument("--max-candidates", type=int, default=8, help="Max candidates per S1 entity")
-    parser.add_argument("--max-s1", type=int, default=0, help="Limit S1 entities for dry-run testing (0 = full)")
+    parser.add_argument("--max-s1", type=int, default=0, help="Limit S1 entities for testing (0 = full)")
     parser.add_argument("--th-link", type=float, default=0.70, help="Probability link threshold")
-    parser.add_argument("--rel-margin", type=float, default=0.70, help="Relative probability margin")
+    parser.add_argument("--rel-margin", type=float, default=0.75, help="Relative probability margin")
     parser.add_argument("--th-singleton", type=float, default=0.35, help="Singleton confidence floor")
+    parser.add_argument("--max-none", type=int, default=1, help="Max missing-address candidates per entity")
+    parser.add_argument("--min-none-name-sim", type=float, default=0.90, help="Min name similarity for missing address")
     args = parser.parse_args()
 
     t_total_start = time.time()
     logger.info("=" * 75)
-    logger.info("AMAZON ML CHALLENGE 2026: FAST POLARS + RAPIDFUZZ SIMD ENGINE")
+    logger.info("AMAZON ML CHALLENGE 2026: CONFLICT-AWARE SIMD INFERENCE ENGINE")
     logger.info("=" * 75)
     logger.info(f"Test Directory    : {args.test_dir}")
-    logger.info(f"Raw Candidates    : {args.raw_candidate}")
-    logger.info(f"Output Candidates : {args.out_candidate}")
-    logger.info(f"Output Matches    : {args.out_matching}")
-    logger.info(f"Max Candidates    : {args.max_candidates} (Compact & High-Reduction)")
+    logger.info(f"Candidate File    : {args.candidate_file}")
+    logger.info(f"Output Matches    : {args.matching_file}")
+    logger.info(f"Model Path        : {args.model_path}")
     logger.info(f"Link Threshold    : {args.th_link}")
     logger.info(f"Relative Margin   : {args.rel_margin}")
     logger.info(f"Singleton Floor   : {args.th_singleton}")
     logger.info("=" * 75)
 
     # 1. Load CatBoost model
-    logger.info(f"Loading CatBoost model from {args.model_path}...")
-    cb_wrapper = joblib.load(args.model_path)
-    cb_model = cb_wrapper["model"] if isinstance(cb_wrapper, dict) else cb_wrapper
-    logger.info("CatBoost model loaded successfully.")
+    logger.info(f"Loading conflict-aware model from {args.model_path}...")
+    model_payload = joblib.load(args.model_path)
+    if isinstance(model_payload, dict):
+        cb_model = model_payload["model"]
+        feature_names = model_payload.get("feature_names", [])
+    else:
+        cb_model = getattr(model_payload, "model", model_payload)
+        feature_names = []
+    logger.info(f"Model loaded successfully ({cb_model.tree_count_} trees).")
 
     # 2. Ingest Target Datasets (S2 + S3) using Polars
     t_targets = time.time()
@@ -106,7 +93,7 @@ def main():
     target_df = pl.concat([s2_df, s3_df])
     logger.info(f"Loaded {len(target_df):,} total target records in {time.time() - t_targets:.2f}s.")
 
-    # 3. Store raw targets in memory (Instant: ~4 seconds)
+    # 3. Store raw targets in memory
     logger.info("Storing raw target strings in memory...")
     t_dict = time.time()
     raw_targets: Dict[str, Tuple[str, str]] = {}
@@ -114,8 +101,8 @@ def main():
         raw_targets[row[0]] = (str(row[1] or ""), str(row[2] or ""))
     logger.info(f"Loaded {len(raw_targets):,} raw targets in {time.time() - t_dict:.2f}s.")
 
-    # Lazy on-demand target cache
-    target_cache: Dict[str, Tuple[str, str, str, int, str, Set[str], Set[str], Set[str], Set[str]]] = {}
+    # Lazy target cache: tid -> preprocessed tuple
+    target_cache: Dict[str, Tuple] = {}
 
     def get_target_info(tid: str):
         info = target_cache.get(tid)
@@ -127,15 +114,15 @@ def main():
         raw_name, raw_addr = raw
         c_name = clean_name(raw_name)
         c_addr = clean_address(raw_addr)
-        is_missing = 1 if not c_addr.strip() else 0
+        is_missing = 1.0 if not c_addr.strip() else 0.0
         dom = extract_domain_stem(raw_name)
         nums = extract_numeric_tokens(f"{c_name} {c_addr}")
         pins = extract_pin_tokens(c_addr)
         pin_houses = extract_numeric_pincode_tokens(c_addr)
         st = get_state(raw_addr)
-        dnum = extract_primary_number(raw_addr)
+        d_num = extract_primary_number(raw_addr)
         words = set(c_name.split())
-        info = (c_name, c_addr, raw_name, is_missing, dom, nums, pins, pin_houses, st, dnum, words)
+        info = (c_name, c_addr, raw_name, is_missing, dom, nums, pins, pin_houses, st, d_num, words)
         target_cache[tid] = info
         return info
 
@@ -149,30 +136,25 @@ def main():
     total_s1 = len(s1_df)
     logger.info(f"Total Source 1 entities to score: {total_s1:,}")
 
-    # Open candidate TSV for streaming
-    logger.info(f"Indexing raw candidate pairs from: {args.raw_candidate}...")
+    # 5. Index Candidate Pairs
+    logger.info(f"Indexing candidate pairs from: {args.candidate_file}...")
     t_cand = time.time()
-    cand_df = pl.read_csv(args.raw_candidate, separator="\t")
+    cand_df = pl.read_csv(args.candidate_file, separator="\t")
     cand_map: Dict[str, List[str]] = {}
     for row in tqdm(cand_df.iter_rows(), total=len(cand_df), desc="Reading Candidates"):
         raw_c = str(row[1] or "")
         cand_map[row[0]] = [c.strip() for c in raw_c.split(",") if c.strip()]
     logger.info(f"Candidate map loaded for {len(cand_map):,} entities in {time.time() - t_cand:.2f}s.")
 
-    # Prepare temporary output paths
-    tmp_matching = args.out_matching + ".fast.tmp"
-    tmp_candidate = args.out_candidate + ".compact.tmp"
+    # 6. Stream and Score
+    tmp_matching = args.matching_file + ".tmp"
     os.makedirs(os.path.dirname(os.path.abspath(tmp_matching)), exist_ok=True)
-
     f_match = open(tmp_matching, "w", encoding="utf-8", newline="\n")
-    f_cand = open(tmp_candidate, "w", encoding="utf-8", newline="\n")
     f_match.write("source1_entity_id\tmatched_entity_ids\n")
-    f_cand.write("source1_entity_id\tcandidate_entity_ids\n")
 
     chunk_size = args.chunk_size
     num_chunks = (total_s1 + chunk_size - 1) // chunk_size
 
-    total_candidates_written = 0
     total_matches_written = 0
     total_singletons_written = 0
 
@@ -187,7 +169,6 @@ def main():
 
         chunk_features = []
         chunk_pairs_meta = []
-        chunk_compact_cands: Dict[str, List[str]] = {}
 
         for row in chunk_df.iter_rows():
             s1_id, raw_name, raw_addr = row[0], str(row[1] or ""), str(row[2] or "")
@@ -200,21 +181,15 @@ def main():
             s1_st = get_state(raw_addr)
             s1_dnum = extract_primary_number(raw_addr)
             s1_words = set(s1_cname.split())
-            STOP = {'the','a','an','of','and','&','or','for','in','at','to','by',
-                    'le','la','les','de','du','des'}
 
             raw_cands = cand_map.get(s1_id, [])
-            pruned_cands = []
+
             for cid in raw_cands:
                 t_info = get_target_info(cid)
-                if t_info:
-                    pruned_cands.append((cid, t_info))
-
-            c_list = [c[0] for c in pruned_cands]
-            chunk_compact_cands[s1_id] = c_list
-
-            for cid, t_info in pruned_cands:
-                t_cname, t_caddr, t_rname, is_missing, t_dom, t_nums, t_pins, t_pin_houses, t_st, t_dnum, t_words = t_info
+                if not t_info:
+                    continue
+                (t_cname, t_caddr, t_rname, is_missing, t_dom, 
+                 t_nums, t_pins, t_pin_houses, t_st, t_dnum, t_words) = t_info
 
                 n_sort = fuzz.token_sort_ratio(s1_cname, t_cname) / 100.0
                 n_set = fuzz.token_set_ratio(s1_cname, t_cname) / 100.0
@@ -241,23 +216,9 @@ def main():
                 len_diff_n = abs(len(s1_cname) - len(t_cname)) / max(len(s1_cname), len(t_cname), 1)
                 len_diff_a = abs(len(s1_caddr) - len(t_caddr)) / max(len(s1_caddr), len(t_caddr), 1) if (s1_caddr and t_caddr) else 1.0
 
-                # State conflict
                 state_conflict = 1.0 if (s1_st and t_st and s1_st != t_st) else 0.0
-
-                # Door conflict (typo-tolerant)
-                door_conflict = 0.0
-                if s1_dnum is not None and t_dnum is not None and abs(s1_dnum - t_dnum) > 1:
-                    ss, ts2 = str(s1_dnum), str(t_dnum)
-                    if not (ss.startswith(ts2) or ts2.startswith(ss)):
-                        door_conflict = 1.0
-
-                # Extra words penalty
-                extra_words = 0.0
-                if s1_words and t_words:
-                    sg = s1_words - t_words - STOP
-                    tg = t_words - s1_words - STOP
-                    if sg and tg:
-                        extra_words = min(1.0, (len(sg)+len(tg)) / max(len(s1_words|t_words), 1))
+                door_conflict = 1.0 if (s1_dnum is not None and t_dnum is not None and s1_dnum != t_dnum and a_sort >= 0.70) else 0.0
+                extra_words = float(len(t_words - s1_words))
 
                 feats = [
                     n_sort, n_set, n_jw, n_lev,
@@ -265,12 +226,12 @@ def main():
                     num_overlap, pin_match, num_pin_match,
                     dom_match, script_mismatch,
                     len_diff_n, len_diff_a,
-                    float(is_missing),
+                    is_missing,
                     state_conflict, door_conflict, extra_words
                 ]
 
                 chunk_features.append(feats)
-                chunk_pairs_meta.append((s1_id, cid))
+                chunk_pairs_meta.append((s1_id, cid, is_missing, n_sort))
 
         # Batch CatBoost Inference
         if chunk_features:
@@ -282,18 +243,12 @@ def main():
         # Aggregate probabilities per S1 entity
         from collections import defaultdict
         s1_probs = defaultdict(list)
-        for (s1_id, cid), prob in zip(chunk_pairs_meta, probs):
-            s1_probs[s1_id].append((cid, prob))
+        for (s1_id, cid, is_miss, n_s), prob in zip(chunk_pairs_meta, probs):
+            s1_probs[s1_id].append((cid, prob, is_miss, n_s))
 
-        # Write chunk outputs to TSVs
+        # Write matching results
         for row in chunk_df.iter_rows():
             s1_id = row[0]
-            # Write compact candidate
-            c_ids = chunk_compact_cands.get(s1_id, [])
-            total_candidates_written += len(c_ids)
-            f_cand.write(f"{s1_id}\t{','.join(c_ids)}\n")
-
-            # Write matching results
             cand_score_list = s1_probs.get(s1_id, [])
             if not cand_score_list:
                 f_match.write(f"{s1_id}\t\n")
@@ -307,10 +262,18 @@ def main():
                 f_match.write(f"{s1_id}\t\n")
                 total_singletons_written += 1
             else:
-                matches = [
-                    cid for cid, p in cand_score_list
-                    if p >= args.th_link and p >= args.rel_margin * max_p
-                ][:5]
+                matches = []
+                none_count = 0
+                for cid, p, is_miss, n_s in cand_score_list:
+                    if p >= args.th_link and p >= args.rel_margin * max_p:
+                        if is_miss == 1.0:
+                            if none_count >= args.max_none:
+                                continue
+                            if n_s < args.min_none_name_sim:
+                                continue
+                            none_count += 1
+                        matches.append(cid)
+
                 if not matches:
                     f_match.write(f"{s1_id}\t\n")
                     total_singletons_written += 1
@@ -319,45 +282,30 @@ def main():
                     total_matches_written += len(matches)
 
         f_match.flush()
-        f_cand.flush()
         elapsed_chunk = time.time() - t_chunk
         logger.info(
             f"Chunk {chunk_idx + 1:2d}/{num_chunks:2d} ({c_start:,}..{c_end:,}) "
-            f"processed in {elapsed_chunk:.1f}s | Pairs scored: {len(chunk_features):,} "
+            f"processed in {elapsed_chunk:.1f}s | Pairs: {len(chunk_features):,} "
             f"({(c_end - c_start) / elapsed_chunk:.0f} entities/s)"
         )
 
     f_match.close()
-    f_cand.close()
+
+    # Atomically replace matching results file
+    if os.path.exists(args.matching_file):
+        backup_path = args.matching_file + ".prev"
+        if os.path.exists(backup_path):
+            os.remove(backup_path)
+        os.rename(args.matching_file, backup_path)
+    os.rename(tmp_matching, args.matching_file)
 
     total_scoring_time = time.time() - t_score_start
     logger.info("=" * 75)
     logger.info(f"Scoring Complete in {total_scoring_time:.1f}s ({total_scoring_time / 60:.1f} minutes)!")
-    logger.info(f"Avg Candidates / Entity : {total_candidates_written / total_s1:.2f} (COMPACT & REDUCED!)")
-    logger.info(f"Avg Matches / Entity    : {total_matches_written / total_s1:.2f} (Ground truth is 3.46)")
-    logger.info(f"Predicted Singletons    : {total_singletons_written:,} ({total_singletons_written / total_s1 * 100:.2f}%)")
+    logger.info(f"Total Matches Written   : {total_matches_written:,}")
+    logger.info(f"Total Singletons Written: {total_singletons_written:,}")
+    logger.info(f"Output File             : {args.matching_file}")
     logger.info("=" * 75)
-
-    # Atomic rename to final target files
-    if os.path.exists(args.out_matching):
-        bak_match = args.out_matching + ".bak"
-        if os.path.exists(bak_match):
-            os.remove(bak_match)
-        os.rename(args.out_matching, bak_match)
-    os.rename(tmp_matching, args.out_matching)
-    logger.info(f"Saved calibrated matches -> {args.out_matching}")
-
-    if os.path.exists(args.out_candidate):
-        bak_cand = args.out_candidate + ".bak"
-        if os.path.exists(bak_cand):
-            os.remove(bak_cand)
-        os.rename(args.out_candidate, bak_cand)
-    os.rename(tmp_candidate, args.out_candidate)
-    logger.info(f"Saved compact candidates -> {args.out_candidate}")
-
-    logger.info(f"Total Execution Time: {time.time() - t_total_start:.1f}s")
-    logger.info("=" * 75)
-
 
 if __name__ == "__main__":
     main()
